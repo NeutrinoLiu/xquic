@@ -192,8 +192,6 @@ int g_random_cid = 0;
 xqc_data_qos_level_t g_dgram_qos_level;
 xqc_conn_settings_t *g_conn_settings;
 
-unsigned char *sock_op_buffer[2000];
-size_t sock_op_buffer_len = 0;
 size_t dgram1_size = 0;
 size_t dgram2_size = 0;
 
@@ -279,75 +277,6 @@ int g_periodically_request = 0;
 
 static uint64_t last_recv_ts = 0;
 
-/*
- CDF file format:
- N (N lines)
- p1(0) v1(0)
- p2 v2
- ....
- pN(1.0) vN
-*/
-static int
-load_cdf(char *cdf_file)
-{
-    FILE *fp = fopen(cdf_file, "r");
-    if (fp == NULL) {
-        return -1;
-    }
-    int n;
-    fscanf(fp, "%d", &n);
-    cdf_list_size = n;
-    cdf_list = malloc(sizeof(cdf_entry_t) * cdf_list_size);
-    while (n--) {
-        fscanf(fp, "%lf%d", &cdf_list[cdf_list_size - n - 1].p, &cdf_list[cdf_list_size - n - 1].val);
-    }
-    return 0;
-}
-
-static void
-destroy_cdf()
-{
-    if (cdf_list != NULL) {
-        free(cdf_list);
-        cdf_list = NULL;
-    }
-}
-
-static int
-get_val_from_cdf_by_p(double p)
-{
-    int last_entry_id = -1, i;
-    double p0 = 0, p1 = 0;
-    int v0 = 0, v1 = 0;
-    int v = 0;
-    for (i = 0; i < cdf_list_size; i++) {
-        if (p > cdf_list[i].p) {
-            last_entry_id = i;
-            p0 = cdf_list[i].p;
-            v0 = cdf_list[i].val;
-        } else {
-            //linear interpolation
-            p1 = cdf_list[i].p;
-            v1 = cdf_list[i].val;
-            v = v0 + (int)(((v1 - v0) / (p1 - p0)) * (p - p0));
-            break;
-        }
-    }
-    if (v == 0) {
-        v = 1;
-    }
-    return v;
-}
-
-static int
-get_random_from_cdf()
-{
-    int r = 1 + (random() % 1000);
-    double p = r * 1.0 / 1000; // 0.001 ~ 1
-    return get_val_from_cdf_by_p(p);
-}
-
-
 static inline uint64_t 
 now()
 {
@@ -358,391 +287,10 @@ now()
     return  ul;
 }
 
-
 static void xqc_client_socket_event_callback(int fd, short what, void *arg);
 static void xqc_client_timeout_callback(int fd, short what, void *arg);
-static void xqc_client_abs_timeout_callback(int, short, void*);
-static void xqc_client_bytestream_timeout_callback(int, short, void*);
-
-/* 用于路径增删debug */
-static void xqc_client_path_callback(int fd, short what, void *arg);
-static void xqc_client_epoch_callback(int fd, short what, void *arg);
-
-/*  */
-
-static void 
-xqc_client_datagram_send(user_conn_t *user_conn)
-{
-    if (user_conn->dgram_not_supported) {
-        // exit
-        printf("[dgram]|peer_does_not_support_datagram|\n");
-        xqc_conn_close(ctx.engine, &user_conn->cid);
-        return;
-    }
-
-    // try to send 0rtt datagram while the client does not have 0rtt transport parameters
-    if (g_test_case == 202) {
-        if (user_conn->dgram_mss == 0) {
-            user_conn->dgram_mss = 1000;
-        }
-    }
-
-    if (user_conn->dgram_mss == 0) {
-        user_conn->dgram_retry_in_hs_cb = 1;
-        printf("[dgram]|waiting_for_max_datagram_frame_size_from_peer|please_retry_in_hs_callback|\n");
-        return;
-    }
-
-    user_dgram_blk_t *dgram_blk = user_conn->dgram_blk;
-    int ret;
-
-    if (g_send_dgram == 1) {
-        if (g_test_case == 203 && user_conn->dgram_mss) {
-            g_test_case = -1;
-            user_conn->dgram_mss++;
-        }
-        uint64_t dgram_id;
-        while (dgram_blk->data_sent < dgram_blk->data_len) {
-            size_t dgram_size = dgram_blk->data_len - dgram_blk->data_sent;
-            if (dgram_size > user_conn->dgram_mss) {
-                dgram_size = user_conn->dgram_mss;
-            }
-            dgram_blk->data[dgram_blk->data_sent] = 0x31;
-            ret = xqc_datagram_send(user_conn->quic_conn, dgram_blk->data + dgram_blk->data_sent, dgram_size, &dgram_id, g_dgram_qos_level);
-            if (ret == -XQC_EAGAIN) {
-                printf("[dgram]|retry_datagram_send_later|\n");
-                return;
-            } else if (ret == -XQC_EDGRAM_TOO_LARGE ) {
-                printf("[dgram]|trying_to_send_an_oversized_datagram|recorded_mss:%zu|send_size:%zu|current_mss:%zu|\n", user_conn->dgram_mss, dgram_size, xqc_datagram_get_mss(user_conn->quic_conn));
-                xqc_conn_close(ctx.engine, &user_conn->cid);
-                return;
-            } else if (ret < 0) {
-                printf("[dgram]|send_datagram_error|err_code:%d|\n", ret);
-                xqc_conn_close(ctx.engine, &user_conn->cid);
-                return;
-            }
-            // printf("[dgram]|send_one_datagram|id:%"PRIu64"|size:%zu|\n", dgram_id, dgram_size);
-            dgram_blk->data_sent += dgram_size;
-
-            if (g_epoch) {
-                break;
-            }
-        }
-    } else if (g_send_dgram == 2) {
-        struct iovec iov[XQC_TEST_DGRAM_BATCH_SZ];
-        uint64_t dgram_id_list[XQC_TEST_DGRAM_BATCH_SZ];
-        size_t bytes_in_batch = 0;
-        int batch_cnt = 0;
-        while ((dgram_blk->data_sent + bytes_in_batch) < dgram_blk->data_len) {
-            if (batch_cnt == 1) {
-                if (g_test_case == 203 && user_conn->dgram_mss) {
-                    g_test_case = -1;
-                    user_conn->dgram_mss++;
-                }
-            }
-            size_t dgram_size = dgram_blk->data_len - dgram_blk->data_sent - bytes_in_batch;
-            size_t succ_sent = 0, succ_sent_bytes = 0;
-            if (dgram_size > user_conn->dgram_mss) {
-                dgram_size = user_conn->dgram_mss;
-            }
-            iov[batch_cnt].iov_base = dgram_blk->data + dgram_blk->data_sent + bytes_in_batch;
-            iov[batch_cnt].iov_len = dgram_size;
-            dgram_blk->data[dgram_blk->data_sent + bytes_in_batch] = 0x31;
-            bytes_in_batch += dgram_size;
-            batch_cnt++;
-            if ((bytes_in_batch + dgram_blk->data_sent) == dgram_blk->data_len
-                || batch_cnt == XQC_TEST_DGRAM_BATCH_SZ) 
-            {
-                ret = xqc_datagram_send_multiple(user_conn->quic_conn, iov, dgram_id_list, batch_cnt, &succ_sent, &succ_sent_bytes, g_dgram_qos_level);
-                if (ret == -XQC_EDGRAM_TOO_LARGE) {
-                    printf("[dgram]|trying_to_send_an_oversized_datagram|recorded_mss:%zu|send_size:%zu|current_mss:%zu|\n", user_conn->dgram_mss, iov[succ_sent].iov_len, xqc_datagram_get_mss(user_conn->quic_conn));
-                    printf("[dgram]|partially_sent_pkts_in_a_batch|cnt:%zu|\n", succ_sent);
-                    xqc_conn_close(ctx.engine, &user_conn->cid);
-                    return;
-                } else if (ret < 0 && ret != -XQC_EAGAIN) {
-                    printf("[dgram]|send_datagram_multiple_error|err_code:%d|\n", ret);
-                    xqc_conn_close(ctx.engine, &user_conn->cid);
-                    return;
-                }
-
-                // for (int i = 0; i < succ_sent; i++) {
-                //     printf("[dgram]|send_one_datagram|id:%"PRIu64"|size:%zu|\n", dgram_id_list[i], iov[i].iov_len);
-                // }
-
-                // printf("[dgram]|datagrams_sent_in_a_batch|cnt:%zu|size:%zu|\n", succ_sent, succ_sent_bytes);
-                
-                dgram_blk->data_sent += succ_sent_bytes;
-                
-                if (ret == -XQC_EAGAIN) {
-                    printf("[dgram]|retry_datagram_send_multiple_later|\n");
-                    return;
-                }
-
-                bytes_in_batch = 0;
-                batch_cnt = 0;
-            }
-        }
-
-    }
-}
-
-static void
-xqc_client_datagram_mss_updated_callback(xqc_connection_t *conn, size_t mss, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    user_conn->dgram_mss = mss;
-    printf("[dgram]|mss_callback|updated_mss:%zu|\n", mss);
-}
-
-static void
-xqc_client_datagram_read_callback(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t dgram_ts)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_echo_check) {
-        memcpy(user_conn->dgram_blk->recv_data + user_conn->dgram_blk->data_recv, data, data_len);
-    }
-    user_conn->dgram_blk->data_recv += data_len;
-    //printf("[dgram]|read_data|size:%zu|recv_time:%"PRIu64"|\n", data_len, dgram_ts);
-    if (g_test_case == 206 && g_no_crypt) {
-        if (dgram1_size == 0) {
-            dgram1_size = data_len;
-        } else {
-            if (dgram2_size == 0) {
-                dgram2_size = data_len;
-            }
-        }
-    }
-}
-
-static void 
-xqc_client_datagram_write_callback(xqc_connection_t *conn, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_send_dgram) {
-        printf("[dgram]|dgram_write|\n");
-        xqc_client_datagram_send(user_conn);
-    }
-}
-
-static void 
-xqc_client_datagram_acked_callback(xqc_connection_t *conn, uint64_t dgram_id, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_test_case == 207) {
-        printf("[dgram]|dgram_acked|dgram_id:%"PRIu64"|\n", dgram_id);
-        g_test_case = -1;
-    }
-}
-
-static int 
-xqc_client_datagram_lost_callback(xqc_connection_t *conn, uint64_t dgram_id, void *user_data)
-{
-    //printf("[dgram]|dgram_lost|dgram_id:%"PRIu64"|\n", dgram_id);
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    //user_conn->dgram_blk->data_lost += data_len;
-    user_conn->dgram_blk->dgram_lost++;
-    if (g_test_case == 205 && g_no_crypt) {
-        printf("[dgram]|dgram_lost|dgram_id:%"PRIu64"|\n", dgram_id);
-    }
-    return 0;
-}
-
-
-static void 
-xqc_client_h3_ext_datagram_send(user_conn_t *user_conn)
-{
-    if (user_conn->dgram_not_supported) {
-        // exit
-        printf("[h3-dgram]|peer_does_not_support_datagram|\n");
-        // xqc_h3_conn_close(ctx.engine, &user_conn->cid);
-        return;
-    }
-
-    // try to send 0rtt datagram while the client does not have 0rtt transport parameters
-    if (g_test_case == 202) {
-        if (user_conn->dgram_mss == 0) {
-            user_conn->dgram_mss = 1000;
-        }
-    }
-
-    if (user_conn->dgram_mss == 0) {
-        user_conn->dgram_retry_in_hs_cb = 1;
-        printf("[h3-dgram]|waiting_for_max_datagram_frame_size_from_peer|please_retry_in_hs_callback|\n");
-        return;
-    }
-
-    user_dgram_blk_t *dgram_blk = user_conn->dgram_blk;
-    int ret;
-
-    if (g_send_dgram == 1) {
-        if (g_test_case == 203 && user_conn->dgram_mss) {
-            g_test_case = -1;
-            user_conn->dgram_mss++;
-        }
-        uint64_t dgram_id;
-        while (dgram_blk->data_sent < dgram_blk->data_len) {
-            size_t dgram_size = dgram_blk->data_len - dgram_blk->data_sent;
-            if (dgram_size > user_conn->dgram_mss) {
-                dgram_size = user_conn->dgram_mss;
-            }
-
-            if (g_epoch) {
-                if (dgram_blk->data_len - dgram_blk->data_sent < 13) {
-                    dgram_blk->data_sent = dgram_blk->data_len;
-                    break;
-                }
-                dgram_blk->data[dgram_blk->data_sent] = 0x32;
-                *(uint32_t*)(dgram_blk->data + dgram_blk->data_sent + 1) = dgram_blk->dgram_id++;
-                *(uint64_t*)(dgram_blk->data + dgram_blk->data_sent + 5) = now();
-
-            } else {
-                dgram_blk->data[dgram_blk->data_sent] = 0x31;
-            }
-            
-            ret = xqc_h3_ext_datagram_send(user_conn->h3_conn, dgram_blk->data + dgram_blk->data_sent, dgram_size, &dgram_id, g_dgram_qos_level);
-            if (ret == -XQC_EAGAIN) {
-                printf("[h3-dgram]|retry_datagram_send_later|\n");
-                return;
-            } else if (ret == -XQC_EDGRAM_TOO_LARGE ) {
-                printf("[h3-dgram]|trying_to_send_an_oversized_datagram|recorded_mss:%zu|send_size:%zu|current_mss:%zu|\n", user_conn->dgram_mss, dgram_size, xqc_h3_ext_datagram_get_mss(user_conn->h3_conn));
-                xqc_h3_conn_close(ctx.engine, &user_conn->cid);
-                return;
-            } else if (ret < 0) {
-                printf("[h3-dgram]|send_datagram_error|err_code:%d|\n", ret);
-                xqc_h3_conn_close(ctx.engine, &user_conn->cid);
-                return;
-            }
-            //printf("[dgram]|send_one_datagram|id:%"PRIu64"|size:%zu|\n", dgram_id, dgram_size);
-            dgram_blk->data_sent += dgram_size;
-            
-            if (g_epoch) {
-                break;
-            }
-        }
-    } else if (g_send_dgram == 2) {
-        struct iovec iov[XQC_TEST_DGRAM_BATCH_SZ];
-        uint64_t dgram_id_list[XQC_TEST_DGRAM_BATCH_SZ];
-        size_t bytes_in_batch = 0;
-        int batch_cnt = 0;
-        while ((dgram_blk->data_sent + bytes_in_batch) < dgram_blk->data_len) {
-            if (batch_cnt == 1) {
-                if (g_test_case == 203 && user_conn->dgram_mss) {
-                    g_test_case = -1;
-                    user_conn->dgram_mss++;
-                }
-            }
-            size_t dgram_size = dgram_blk->data_len - dgram_blk->data_sent - bytes_in_batch;
-            size_t succ_sent = 0, succ_sent_bytes = 0;
-            if (dgram_size > user_conn->dgram_mss) {
-                dgram_size = user_conn->dgram_mss;
-            }
-            iov[batch_cnt].iov_base = dgram_blk->data + dgram_blk->data_sent + bytes_in_batch;
-            iov[batch_cnt].iov_len = dgram_size;
-            dgram_blk->data[dgram_blk->data_sent + bytes_in_batch] = 0x31;
-            bytes_in_batch += dgram_size;
-            batch_cnt++;
-            if ((bytes_in_batch + dgram_blk->data_sent) == dgram_blk->data_len
-                || batch_cnt == XQC_TEST_DGRAM_BATCH_SZ) 
-            {
-                ret = xqc_h3_ext_datagram_send_multiple(user_conn->h3_conn, iov, dgram_id_list, batch_cnt, &succ_sent, &succ_sent_bytes, g_dgram_qos_level);
-                if (ret == -XQC_EDGRAM_TOO_LARGE) {
-                    printf("[h3-dgram]|trying_to_send_an_oversized_datagram|recorded_mss:%zu|send_size:%zu|current_mss:%zu|\n", user_conn->dgram_mss, iov[succ_sent].iov_len, xqc_h3_ext_datagram_get_mss(user_conn->h3_conn));
-                    printf("[h3-dgram]|partially_sent_pkts_in_a_batch|cnt:%zu|\n", succ_sent);
-                    xqc_h3_conn_close(ctx.engine, &user_conn->cid);
-                    return;
-                } else if (ret < 0 && ret != -XQC_EAGAIN) {
-                    printf("[h3-dgram]|send_datagram_multiple_error|err_code:%d|\n", ret);
-                    xqc_h3_conn_close(ctx.engine, &user_conn->cid);
-                    return;
-                }
-
-                // for (int i = 0; i < succ_sent; i++) {
-                //     printf("[dgram]|send_one_datagram|id:%"PRIu64"|size:%zu|\n", dgram_id_list[i], iov[i].iov_len);
-                // }
-
-                // printf("[dgram]|datagrams_sent_in_a_batch|cnt:%zu|size:%zu|\n", succ_sent, succ_sent_bytes);
-                
-                dgram_blk->data_sent += succ_sent_bytes;
-                
-                if (ret == -XQC_EAGAIN) {
-                    printf("[h3-dgram]|retry_datagram_send_multiple_later|\n");
-                    return;
-                } 
-
-                bytes_in_batch = 0;
-                batch_cnt = 0;
-            }
-        }
-
-    }
-}
-
-
-static void
-xqc_client_h3_ext_datagram_mss_updated_callback(xqc_h3_conn_t *conn, size_t mss, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    user_conn->dgram_mss = mss;
-    printf("[h3-dgram]|callback|updated_mss:%zu|\n", mss);
-}
-
-static void
-xqc_client_h3_ext_datagram_read_callback(xqc_h3_conn_t *conn, const void *data, size_t data_len, void *user_data, uint64_t ts)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_echo_check) {
-        memcpy(user_conn->dgram_blk->recv_data + user_conn->dgram_blk->data_recv, data, data_len);
-    }
-    user_conn->dgram_blk->data_recv += data_len;
-    // printf("[h3-dgram]|read_data|size:%zu|recv_time:%"PRIu64"|\n", data_len, ts);
-    if (g_test_case == 206 && g_no_crypt) {
-        if (dgram1_size == 0) {
-            dgram1_size = data_len;
-        } else {
-            if (dgram2_size == 0) {
-                dgram2_size = data_len;
-            }
-        }
-    }
-}
-
-static void 
-xqc_client_h3_ext_datagram_write_callback(xqc_h3_conn_t *conn, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_send_dgram) {
-        printf("[h3-dgram]|dgram_write|\n");
-        xqc_client_h3_ext_datagram_send(user_conn);
-    }
-}
-
-static void
-xqc_client_h3_ext_datagram_acked_callback(xqc_h3_conn_t *conn, uint64_t dgram_id, void *user_data)
-{
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    if (g_test_case == 207) {
-        printf("[h3-dgram]|dgram_acked|dgram_id:%"PRIu64"|\n", dgram_id);
-        g_test_case = -1;
-    }
-    // printf("[h3-dgram]|latest_rtt:%"PRIu64"|\n", xqc_conn_get_lastest_rtt(ctx.engine, &user_conn->cid));
-}
-
-static int 
-xqc_client_h3_ext_datagram_lost_callback(xqc_h3_conn_t *conn, uint64_t dgram_id, void *user_data)
-{
-    //printf("[dgram]|dgram_lost|dgram_id:%"PRIu64"|\n", dgram_id);
-    user_conn_t *user_conn = (user_conn_t*)user_data;
-    user_conn->dgram_blk->data_lost += 0;
-    user_conn->dgram_blk->dgram_lost++;
-    if (g_test_case == 205 && g_no_crypt) {
-        printf("[h3-dgram]|dgram_lost|dgram_id:%"PRIu64"|\n", dgram_id);
-    }
-    return 0;
-}
-
 
 static void xqc_client_timeout_multi_process_callback(int fd, short what, void *arg);
-
 
 void
 xqc_client_set_event_timer(xqc_msec_t wake_after, void *user_data)
@@ -798,9 +346,6 @@ xqc_client_save_token(const unsigned char *token, unsigned token_len, void *user
     user_conn_t *user_conn = (user_conn_t*)user_data;
     printf("xqc_client_save_token use client ip as the key. h3[%d]\n", user_conn->h3);
 
-    if (g_test_case == 16) { /* test application delay */
-        usleep(300*1000);
-    }
     int fd = open("./xqc_token", O_TRUNC | O_CREAT | O_WRONLY, S_IRWXU);
     if (fd < 0) {
         printf("save token error %s\n", strerror(errno));
@@ -884,17 +429,6 @@ xqc_client_write_socket(const unsigned char *buf, size_t size,
     send_buf_size = size;
     memcpy(send_buf, buf, send_buf_size);
 
-    /* trigger version negotiation */
-    if (g_test_case == 33) {
-        /* makes version 0xff000001 */
-        send_buf[1] = 0xff;
-    }
-
-    /* make initial packet loss to test 0rtt buffer */
-    if (g_test_case == 39) {
-        g_test_case = -1;
-        return size;
-    }
 
     do {
         errno = 0;
@@ -903,63 +437,6 @@ xqc_client_write_socket(const unsigned char *buf, size_t size,
 
         if (TEST_DROP) {
             return send_buf_size;
-        }
-        if (g_test_case == 5) { /* socket send fail */
-            g_test_case = -1;
-            errno = EAGAIN;
-            return XQC_SOCKET_EAGAIN;
-        }
-
-        /* client Initial dcid corruption */
-        if (g_test_case == 22) {
-            /* client initial dcid corruption, bytes [6, 13] is the DCID of xquic's Initial packet */
-            g_test_case = -1;
-            send_buf[6] = ~send_buf[6];
-            printf("test case 22, corrupt byte[6]\n");
-        }
-
-        /* client Initial scid corruption */
-        if (g_test_case == 23) {
-            /* bytes [15, 22] is the SCID of xquic's Initial packet */
-            g_test_case = -1;
-            send_buf[15] = ~send_buf[15];
-            printf("test case 23, corrupt byte[15]\n");
-        }
-
-        // drop the first datagram packet
-        if ((g_test_case == 205 || g_test_case == 206) && g_no_crypt && !dgram_drop_pkt1) {
-            int header_type = send_buf[0] & 0x80;
-            if (header_type == 0x80) {
-                // long header: 29B + 3B (frame header)
-                int lp_type = send_buf[0] & 0x30;
-                if (lp_type == 0x10) {
-                    //0RTT pkt
-                    if (send_buf[29] == 0x31) {
-                        //datagram frame
-                        if (g_test_case == 206) {
-                            //hold data & swap the order with the next one
-                            //swap 1st & 2nd dgram
-                            memcpy(sock_op_buffer, send_buf, send_buf_size);
-                            sock_op_buffer_len = send_buf_size;
-                        }
-                        dgram_drop_pkt1 = 1;
-                        return send_buf_size;
-                    }
-                }
-            } else {
-                // short header: 13B + 3B (frame header)
-                if (send_buf[13] == 0x31) {
-                    //datagram frame
-                    if (g_test_case == 206) {
-                        //hold data & swap the order with the next one
-                        //swap 1st & 2nd dgram
-                        memcpy(sock_op_buffer, send_buf, send_buf_size);
-                        sock_op_buffer_len = send_buf_size;
-                    }
-                    dgram_drop_pkt1 = 1;
-                    return send_buf_size;
-                }
-            }
         }
 
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
@@ -973,31 +450,6 @@ xqc_client_write_socket(const unsigned char *buf, size_t size,
             }
         }
 
-        if (sock_op_buffer_len) {
-            int header_type = send_buf[0] & 0x80;
-            int frame_type = -1;
-            if (header_type == 0x80) {
-                // long header: 29B + 3B (frame header)
-                int lp_type = send_buf[0] & 0x30;
-                if (lp_type == 0x10) {
-                    //0RTT pkt
-                    frame_type = send_buf[29];
-                }  
-            } else {
-                frame_type = send_buf[13];
-            }
-            if (frame_type == 0x31) {
-                int tmp = sendto(fd, sock_op_buffer, sock_op_buffer_len, 0, peer_addr, peer_addrlen);
-                if (tmp < 0) {
-                    res = tmp;
-                    printf("xqc_client_write_socket err %zd %s\n", res, strerror(errno));
-                    if (errno == EAGAIN) {
-                        res = XQC_SOCKET_EAGAIN;
-                    }
-                }
-                sock_op_buffer_len = 0;
-            }
-        }
     } while ((res < 0) && (errno == EINTR));
 
     return res;
@@ -1034,65 +486,6 @@ xqc_client_write_socket_ex(uint64_t path_id,
     int fd = 0;
 
 
-    /* test stateless reset after handshake completed */
-    if (g_test_case == 41) {
-        if (hsk_completed && ((buf[0] & 0xC0) == 0x40)) {
-            if (user_conn->tracked_pkt_cnt < 2) {
-                /* send 10 pkts first */
-                user_conn->tracked_pkt_cnt++;
-
-            } else {
-                /* delay short header packet to make server idle timeout */
-                uint64_t nowtime = now();
-
-                if (user_conn->black_hole_start_time == 0) {
-                    user_conn->black_hole_start_time = nowtime;
-                    printf("   blackhole start: %"PRIu64"\n", nowtime);
-                }
-
-                if (nowtime - user_conn->black_hole_start_time <= 3000000) {
-                    return size;
-                }
-
-                /* keep blackhole more than 2 seconds, turn off */
-                printf("   blackhole end: %"PRIu64"\n", nowtime);
-                g_test_case = -1;
-            }
-        }
-    }
-
-    /* test stateless rset during handshake */
-    if (g_test_case == 45) {
-        uint64_t nowtime = now();
-        if (user_conn->black_hole_start_time == 0) {
-
-            if ((((buf[0] & 0x80) == 0x80) && ((buf[0] & 0x30) >> 4) == 2)
-                || ((buf[0] & 0xC0) == 0x40))
-            {
-                if (user_conn->black_hole_start_time == 0) {
-                    user_conn->black_hole_start_time = nowtime;
-                    printf("   blackhole start: %"PRIu64"\n", nowtime);
-                }
-
-                printf("... block:%zu\n", size);
-                return size;
-            }
-
-        } else {
-            /* drop all client's packet */
-
-            if (nowtime - user_conn->black_hole_start_time <= 10000000) {
-                printf("... block:%zu\n", size);
-                return size;
-            }
-
-            /* keep blackhole more than 2 seconds, turn off */
-            printf("   blackhole end: %"PRIu64"\n", nowtime);
-            g_test_case = -1;
-
-        }
-    }
-
     /* get path fd */
     fd = xqc_client_get_path_fd_by_id(user_conn, path_id);
 
@@ -1107,29 +500,8 @@ xqc_client_write_socket_ex(uint64_t path_id,
     send_buf_size = size;
     memcpy(send_buf, buf, send_buf_size);
 
-    /* trigger version negotiation */
-    if (g_test_case == 33) {
-        /* makes version 0xff000001 */
-        send_buf[1] = 0xff;
-    }
-
-    /* make initial packet loss to test 0rtt buffer */
-    if (g_test_case == 39) {
-        g_test_case = -1;
-        return size;
-    }
-
     if (g_enable_multipath) {
         g_client_path[path_id].send_size += size;
-    }
-
-    if (hsk_completed) {
-        if (g_test_case == 103 && path_id == 0 && g_client_path[0].send_size > g_send_body_size/10) {
-            fd = g_client_path[0].rebinding_path_fd;
-        }
-        else if (g_test_case == 104 && path_id == 1 && g_client_path[1].send_size > 10240) {
-            fd = g_client_path[1].rebinding_path_fd;
-        }
     }
 
     do {
@@ -1139,63 +511,6 @@ xqc_client_write_socket_ex(uint64_t path_id,
 
         if (TEST_DROP) {
             return send_buf_size;
-        }
-        if (g_test_case == 5) { /* socket send fail */
-            g_test_case = -1;
-            errno = EAGAIN;
-            return XQC_SOCKET_EAGAIN;
-        }
-
-        /* client Initial dcid corruption */
-        if (g_test_case == 22) {
-            /* client initial dcid corruption, bytes [6, 13] is the DCID of xquic's Initial packet */
-            g_test_case = -1;
-            send_buf[6] = ~send_buf[6];
-            printf("test case 22, corrupt byte[6]\n");
-        }
-
-        /* client Initial scid corruption */
-        if (g_test_case == 23) {
-            /* bytes [15, 22] is the SCID of xquic's Initial packet */
-            g_test_case = -1;
-            send_buf[15] = ~send_buf[15];
-            printf("test case 23, corrupt byte[15]\n");
-        }
-
-        // drop the first datagram packet
-        if ((g_test_case == 205 || g_test_case == 206) && g_no_crypt && !dgram_drop_pkt1) {
-            int header_type = send_buf[0] & 0x80;
-            if (header_type == 0x80) {
-                // long header: 29B + 3B (frame header)
-                int lp_type = send_buf[0] & 0x30;
-                if (lp_type == 0x10) {
-                    //0RTT pkt
-                    if (send_buf[29] == 0x31) {
-                        //datagram frame
-                        if (g_test_case == 206) {
-                            //hold data & swap the order with the next one
-                            //swap 1st & 2nd dgram
-                            memcpy(sock_op_buffer, send_buf, send_buf_size);
-                            sock_op_buffer_len = send_buf_size;
-                        }
-                        dgram_drop_pkt1 = 1;
-                        return send_buf_size;
-                    }
-                }
-            } else {
-                // short header: 13B + 3B (frame header)
-                if (send_buf[13] == 0x31) {
-                    //datagram frame
-                    if (g_test_case == 206) {
-                        //hold data & swap the order with the next one
-                        //swap 1st & 2nd dgram
-                        memcpy(sock_op_buffer, send_buf, send_buf_size);
-                        sock_op_buffer_len = send_buf_size;
-                    }
-                    dgram_drop_pkt1 = 1;
-                    return send_buf_size;
-                }
-            }
         }
 
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
@@ -1211,42 +526,10 @@ xqc_client_write_socket_ex(uint64_t path_id,
             }
         }
 
-        if (sock_op_buffer_len) {
-            int header_type = send_buf[0] & 0x80;
-            int frame_type = -1;
-            if (header_type == 0x80) {
-                // long header: 29B + 3B (frame header)
-                int lp_type = send_buf[0] & 0x30;
-                if (lp_type == 0x10) {
-                    //0RTT pkt
-                    frame_type = send_buf[29];
-                }  
-            } else {
-                frame_type = send_buf[13];
-            }
-            if (frame_type == 0x31) {
-                int tmp = sendto(fd, sock_op_buffer, sock_op_buffer_len, 0, peer_addr, peer_addrlen);
-                if (tmp < 0) {
-                    res = tmp;
-                    printf("xqc_client_write_socket err %zd %s\n", res, strerror(errno));
-                    if (errno == EAGAIN) {
-                        res = XQC_SOCKET_EAGAIN;
-                    }
-                }
-                sock_op_buffer_len = 0;
-            }
-        }
 
     } while ((res < 0) && (errno == EINTR));
 
     return res;
-}
-
-ssize_t
-xqc_client_send_stateless_reset(const unsigned char *buf, size_t size,
-    const struct sockaddr *peer_addr, socklen_t peer_addrlen, int fd, void *user)
-{
-    return xqc_client_write_socket(buf, size, peer_addr, peer_addrlen, user);
 }
 
 xqc_int_t 
@@ -1256,90 +539,6 @@ xqc_client_conn_closing_notify(xqc_connection_t *conn,
     printf("conn closing: %d\n", err_code);
     return XQC_OK;
 }
-
-
-#if defined(XQC_SUPPORT_SENDMMSG)
-ssize_t 
-xqc_client_write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
-    const struct sockaddr *peer_addr, socklen_t peer_addrlen, void *user)
-{
-    const int MAX_SEG = 128;
-    user_conn_t *user_conn = (user_conn_t *) user;
-    ssize_t res = 0;
-    int fd = user_conn->fd;
-    struct mmsghdr mmsg[MAX_SEG];
-    memset(&mmsg, 0, sizeof(mmsg));
-    for (int i = 0; i < vlen; i++) {
-        mmsg[i].msg_hdr.msg_iov = (struct iovec *)&msg_iov[i];
-        mmsg[i].msg_hdr.msg_iovlen = 1;
-    }
-    do {
-        errno = 0;
-        if (TEST_DROP) return vlen;
-
-        if (g_test_case == 5) { /* socket send fail */
-            g_test_case = -1;
-            errno = EAGAIN;
-            return XQC_SOCKET_EAGAIN;
-        }
-
-        res = sendmmsg(fd, mmsg, vlen, 0);
-        if (res < 0) {
-            printf("sendmmsg err %zd %s\n", res, strerror(errno));
-            if (errno == EAGAIN) {
-                res = XQC_SOCKET_EAGAIN;
-            }
-        }
-    } while ((res < 0) && (errno == EINTR));
-    return res;
-}
-
-
-ssize_t
-xqc_client_mp_write_mmsg(uint64_t path_id,
-    const struct iovec *msg_iov, unsigned int vlen,
-    const struct sockaddr *peer_addr, socklen_t peer_addrlen, void *user)
-{
-    const int MAX_SEG = 128;
-    user_conn_t *user_conn = (user_conn_t *) user;
-    ssize_t res = 0;
-    int fd = 0;
-
-    /* check whether it's initial path */
-    if (path_id == 0) {
-        fd = user_conn->fd;
-    } else {
-        fd = g_client_path[path_id].path_fd;
-    }
-
-    struct mmsghdr mmsg[MAX_SEG];
-    memset(&mmsg, 0, sizeof(mmsg));
-    for (int i = 0; i < vlen; i++) {
-        mmsg[i].msg_hdr.msg_iov = (struct iovec *)&msg_iov[i];
-        mmsg[i].msg_hdr.msg_iovlen = 1;
-    }
-    do {
-        errno = 0;
-        if (TEST_DROP) return vlen;
-
-        if (g_test_case == 5) { /* socket send fail */
-            g_test_case = -1;
-            errno = EAGAIN;
-            return XQC_SOCKET_EAGAIN;
-        }
-
-        res = sendmmsg(fd, mmsg, vlen, 0);
-        if (res < 0) {
-            printf("sendmmsg err %zd %s\n", res, strerror(errno));
-            if (errno == EAGAIN) {
-                res = XQC_SOCKET_EAGAIN;
-            }
-        }
-    } while ((res < 0) && (errno == EINTR));
-    return res;
-}
-#endif
-
 
 static int
 xqc_client_bind_to_interface(int fd, 
@@ -1481,15 +680,6 @@ xqc_client_create_path_socket(xqc_user_path_t *path,
         return XQC_ERROR;
     }
 
-    if (g_test_case == 103 || g_test_case == 104) {
-        path->rebinding_path_fd = xqc_client_create_socket((g_ipv6 ? AF_INET6 : AF_INET), 
-                                                            path->peer_addr, path->peer_addrlen, path_interface);
-        if (path->rebinding_path_fd < 0) {
-            printf("|xqc_client_create_path_socket error|");
-            return XQC_ERROR;
-        }
-    }
-
     return XQC_OK;
 }
 
@@ -1514,46 +704,7 @@ xqc_client_create_path(xqc_user_path_t *path,
                 EV_READ | EV_PERSIST, xqc_client_socket_event_callback, user_conn);
     event_add(path->ev_socket, NULL);
 
-    if (g_test_case == 103 || g_test_case == 104) {
-        path->rebinding_ev_socket = event_new(eb, path->rebinding_path_fd, EV_READ | EV_PERSIST,
-                                              xqc_client_socket_event_callback, user_conn);
-        event_add(path->rebinding_ev_socket, NULL);
-    }
-
     return XQC_OK;
-}
-
-user_conn_t * 
-xqc_client_user_conn_multi_process_create(client_ctx_t *ctx, const char *server_addr, int server_port,
-    int transport)
-{
-    user_conn_t *user_conn = calloc(1, sizeof(user_conn_t));
-    /* use HTTP3? */
-    user_conn->h3 = transport;
-    user_conn->ctx = ctx;
-
-    user_conn->ev_timeout = event_new(ctx->eb, -1, 0, xqc_client_timeout_multi_process_callback, user_conn);
-    
-    /* set connection timeout */
-    struct timeval tv;
-    tv.tv_sec = g_conn_timeout;
-    tv.tv_usec = 0;
-    event_add(user_conn->ev_timeout, &tv);
-
-    int ip_type = (g_ipv6 ? AF_INET6 : AF_INET);
-    xqc_client_init_addr(user_conn, server_addr, server_port);
-                                      
-    user_conn->fd = xqc_client_create_socket(ip_type, 
-            user_conn->peer_addr, user_conn->peer_addrlen, NULL);
-    if (user_conn->fd < 0) {
-        printf("xqc_create_socket error\n");
-        return NULL;
-    }
-    user_conn->ev_socket = event_new(ctx->eb, user_conn->fd, EV_READ | EV_PERSIST, 
-                                     xqc_client_socket_event_callback, user_conn);
-    event_add(user_conn->ev_socket, NULL);
-
-    return user_conn;
 }
 
 user_conn_t * 
@@ -1571,22 +722,6 @@ xqc_client_user_conn_create(const char *server_addr, int server_port,
     tv.tv_sec = g_conn_timeout;
     tv.tv_usec = 0;
     event_add(user_conn->ev_timeout, &tv);
-
-    if (g_epoch > 0) {
-        user_conn->ev_epoch = event_new(eb, -1, 0, xqc_client_epoch_callback, user_conn);
-        tv.tv_sec = g_epoch_timeout / 1000000;
-        tv.tv_usec = g_epoch_timeout % 1000000;
-        event_add(user_conn->ev_epoch, &tv);
-        printf("epoch timer set!\n");
-    }
-
-    if (g_conn_abs_timeout > 0) {
-        user_conn->ev_abs_timeout = event_new(eb, -1, 0, xqc_client_abs_timeout_callback, user_conn);
-        tv.tv_sec = g_conn_abs_timeout;
-        tv.tv_usec = 0;
-        event_add(user_conn->ev_abs_timeout, &tv);
-    }
-
 
     user_conn->conn_create_time = now();
 
@@ -1615,21 +750,6 @@ xqc_client_create_conn_socket(user_conn_t *user_conn)
 }
 
 void
-xqc_client_set_path_debug_timer(user_conn_t *user_conn)
-{
-    if (g_debug_path || g_test_case == 110) {
-        if (user_conn->ev_path == NULL) {
-            user_conn->ev_path = event_new(eb, -1, 0, xqc_client_path_callback, user_conn);
-        }
-
-        struct timeval tv;
-        tv.tv_sec = g_path_timeout / 1000000;
-        tv.tv_usec = g_path_timeout % 1000000;
-        event_add(user_conn->ev_path, &tv);
-    }
-}
-
-void
 xqc_client_path_removed(const xqc_cid_t *scid, uint64_t path_id,
     void *conn_user_data)
 {
@@ -1645,9 +765,6 @@ xqc_client_path_removed(const xqc_cid_t *scid, uint64_t path_id,
             g_client_path[i].is_in_used = 0;
             
             printf("***** path removed. index: %d, path_id: %" PRIu64 "\n", i, path_id);
-
-            xqc_client_set_path_debug_timer(user_conn);
-            
             break;
         }
     }
@@ -1665,10 +782,6 @@ xqc_client_conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     user_conn->dgram_mss = xqc_datagram_get_mss(conn);
     user_conn->quic_conn = conn;
 
-    if (g_test_case == 200 || g_test_case == 201) {
-        printf("[dgram-200]|0RTT|initial_mss:%zu|\n", user_conn->dgram_mss);
-    }
-
     printf("xqc_conn_is_ready_to_send_early_data:%d\n", xqc_conn_is_ready_to_send_early_data(conn));
     return 0;
 }
@@ -1681,11 +794,7 @@ xqc_client_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     user_conn_t *user_conn = (user_conn_t *)user_data;
 
     client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
+    p_ctx = &ctx;
 
     xqc_int_t err = xqc_conn_get_errno(conn);
     printf("should_clear_0rtt_ticket, conn_err:%d, clear_0rtt_ticket:%d\n", err, xqc_conn_should_clear_0rtt_ticket(err));
@@ -1696,20 +805,8 @@ xqc_client_conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
 
     printf("conn_info: \"%s\"\n", stats.conn_info);
 
-    if (!g_test_qch_mode) {
-        printf("[dgram]|recv_dgram_bytes:%zu|sent_dgram_bytes:%zu|lost_dgram_bytes:%zu|lost_cnt:%zu|\n", 
-               user_conn->dgram_blk->data_recv, user_conn->dgram_blk->data_sent,
-               user_conn->dgram_blk->data_lost, user_conn->dgram_blk->dgram_lost);
-    }
 
-
-    if (g_test_qch_mode) {
-        if (p_ctx->cur_conn_num == 0) {
-            event_base_loopbreak(p_ctx->eb);
-        }
-    } else {
-        event_base_loopbreak(eb);
-    }
+    event_base_loopbreak(eb);
     return 0;
 }
 
@@ -1745,191 +842,20 @@ xqc_client_conn_handshake_finished(xqc_connection_t *conn, void *user_data, void
 {
     DEBUG;
     user_conn_t *user_conn = (user_conn_t *) user_data;
-    if (!g_test_qch_mode) {
-        if (!g_mp_ping_on) {
-            xqc_conn_send_ping(ctx.engine, &user_conn->cid, NULL);
-            xqc_conn_send_ping(ctx.engine, &user_conn->cid, &g_ping_id);
-        }  
+    if (!g_mp_ping_on) {
+        xqc_conn_send_ping(ctx.engine, &user_conn->cid, NULL);
+        xqc_conn_send_ping(ctx.engine, &user_conn->cid, &g_ping_id);
+    }  
 
-        printf("====>DCID:%s\n", xqc_dcid_str_by_scid(ctx.engine, &user_conn->cid));
-        printf("====>SCID:%s\n", xqc_scid_str(&user_conn->cid));
-    }
+    printf("====>DCID:%s\n", xqc_dcid_str_by_scid(ctx.engine, &user_conn->cid));
+    printf("====>SCID:%s\n", xqc_scid_str(&user_conn->cid));
 
     hsk_completed = 1;
 
     user_conn->dgram_mss = xqc_datagram_get_mss(conn);
     if (user_conn->dgram_mss == 0) {
         user_conn->dgram_not_supported = 1; 
-        if (g_test_case == 204) {
-            user_conn->dgram_not_supported = 0;
-            user_conn->dgram_mss = 1000;
-        }
     }
-    if (g_test_case == 200 || g_test_case == 201) {
-        printf("[dgram-200]|1RTT|updated_mss:%zu|\n", user_conn->dgram_mss);
-    }
-    
-    if (g_send_dgram && user_conn->dgram_retry_in_hs_cb) {
-        xqc_client_datagram_send(user_conn);
-    }
-}
-
-int
-xqc_client_h3_conn_create_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data)
-{
-    DEBUG;
-
-    user_conn_t *user_conn = (user_conn_t *) user_data;
-    if (g_test_case == 18) { /* test h3 settings */
-        xqc_h3_conn_settings_t settings = {
-            .max_field_section_size = 512,
-            .qpack_enc_max_table_capacity = 4096,
-            .qpack_dec_max_table_capacity = 4096,
-            .qpack_blocked_streams = 32,
-        };
-        xqc_h3_conn_set_settings(conn, &settings);
-    }
-
-    if (g_test_case == 32) {
-        xqc_h3_conn_settings_t settings = {
-            .max_field_section_size = 10000000,
-            .qpack_enc_max_table_capacity = 4096,
-            .qpack_dec_max_table_capacity = 4096,
-            .qpack_blocked_streams = 32,
-        };
-        xqc_h3_conn_set_settings(conn, &settings);
-    }
-
-    if (g_test_case == 19) { /* test header size constraints */
-        xqc_h3_conn_settings_t settings = {
-            .max_field_section_size = 100,
-        };
-        xqc_h3_conn_set_settings(conn, &settings);
-    }
-
-    user_conn->dgram_mss = xqc_h3_ext_datagram_get_mss(conn);
-    user_conn->h3_conn = conn;
-
-    if (g_test_case == 200 || g_test_case == 201) {
-        printf("[h3-dgram-200]|0RTT|initial_mss:%zu|\n", user_conn->dgram_mss);
-    }
-
-    printf("xqc_h3_conn_is_ready_to_send_early_data:%d\n", xqc_h3_conn_is_ready_to_send_early_data(conn));
-    return 0;
-}
-
-
-
-int
-xqc_client_h3_conn_close_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *user_data)
-{
-    DEBUG;
-
-    user_conn_t *user_conn = (user_conn_t *) user_data;
-    printf("conn errno:%d\n", xqc_h3_conn_get_errno(conn));
-    client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
-
-    xqc_int_t err = xqc_h3_conn_get_errno(conn);
-    printf("should_clear_0rtt_ticket, conn_err:%d, clear_0rtt_ticket:%d\n", err, xqc_conn_should_clear_0rtt_ticket(err));
-
-    xqc_conn_stats_t stats = xqc_conn_get_stats(p_ctx->engine, cid);
-    printf("send_count:%u, lost_count:%u, tlp_count:%u, recv_count:%u, srtt:%"PRIu64" early_data_flag:%d, conn_err:%d, mp_state:%d, ack_info:%s, alpn:%s, conn_info:%s\n",
-           stats.send_count, stats.lost_count, stats.tlp_count, stats.recv_count, stats.srtt, stats.early_data_flag, stats.conn_err, stats.mp_state, stats.ack_info, stats.alpn, stats.conn_info);
-
-    if (!g_test_qch_mode) {
-        printf("[h3-dgram]|recv_dgram_bytes:%zu|sent_dgram_bytes:%zu|lost_dgram_bytes:%zu|lost_cnt:%zu|\n", 
-               user_conn->dgram_blk->data_recv, user_conn->dgram_blk->data_sent,
-               user_conn->dgram_blk->data_lost, user_conn->dgram_blk->dgram_lost);
-    }
-    
-
-    if (g_test_qch_mode) {
-        if (p_ctx->cur_conn_num == 0) {
-            event_base_loopbreak(p_ctx->eb);
-        }
-    } else {
-        event_base_loopbreak(eb);
-    }
-    return 0;
-}
-
-void
-xqc_client_h3_conn_handshake_finished(xqc_h3_conn_t *h3_conn, void *user_data)
-{
-    DEBUG;
-    user_conn_t *user_conn = (user_conn_t *) user_data;
-    client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
-
-    if (!g_mp_ping_on) {
-        xqc_h3_conn_send_ping(p_ctx->engine, &user_conn->cid, NULL);
-        xqc_h3_conn_send_ping(p_ctx->engine, &user_conn->cid, &g_ping_id);
-    }
-
-    xqc_conn_stats_t stats = xqc_conn_get_stats(p_ctx->engine, &user_conn->cid);
-    printf("0rtt_flag:%d\n", stats.early_data_flag);
-
-    if (g_enable_multipath) {
-        printf("transport_parameter:enable_multipath=%d\n", stats.enable_multipath);
-    }
-
-    printf("====>DCID:%s\n", xqc_dcid_str_by_scid(p_ctx->engine, &user_conn->cid));
-    printf("====>SCID:%s\n", xqc_scid_str(&user_conn->cid));
-
-    hsk_completed = 1;
-
-    user_conn->dgram_mss = xqc_h3_ext_datagram_get_mss(h3_conn);
-    if (user_conn->dgram_mss == 0) {
-        user_conn->dgram_not_supported = 1; 
-        if (g_test_case == 204) {
-            user_conn->dgram_not_supported = 0;
-            user_conn->dgram_mss = 1000;
-        }
-    }
-
-    if (g_test_case == 200 || g_test_case == 201) {
-        printf("[h3-dgram-200]|1RTT|updated_mss:%zu|\n", user_conn->dgram_mss);
-    }
-    
-    if (g_send_dgram && user_conn->dgram_retry_in_hs_cb) {
-        xqc_client_h3_ext_datagram_send(user_conn);
-    }
-}
-
-void
-xqc_client_h3_conn_ping_acked_notify(xqc_h3_conn_t *conn, const xqc_cid_t *cid, void *ping_user_data, void *user_data)
-{
-    DEBUG;
-    if (ping_user_data) {
-        printf("====>ping_id:%d\n", *(int *) ping_user_data);
-
-    } else {
-        printf("====>no ping_id\n");
-    }
-}
-
-void
-xqc_client_h3_conn_update_cid_notify(xqc_h3_conn_t *conn, const xqc_cid_t *retire_cid, const xqc_cid_t *new_cid, void *user_data)
-{
-    DEBUG;
-
-    user_conn_t *user_conn = (user_conn_t *) user_data;
-
-    memcpy(&user_conn->cid, new_cid, sizeof(*new_cid));
-
-    printf("====>RETIRE SCID:%s\n", xqc_scid_str(retire_cid));
-    printf("====>SCID:%s\n", xqc_scid_str(new_cid));
-    printf("====>DCID:%s\n", xqc_dcid_str_by_scid(ctx.engine, new_cid));
-
 }
 
 int
@@ -1937,11 +863,6 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
 {
     static int send_cnt = 0;
     printf("|xqc_client_stream_send|cnt:%d|\n", ++send_cnt);
-
-    if (g_test_case == 99) {
-        xqc_stream_send(stream, NULL, 0, 1);
-        return 0;
-    }
 
     ssize_t ret;
     user_stream_t *user_stream = (user_stream_t *) user_data;
@@ -1955,10 +876,6 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
         if (g_read_body) {
             user_stream->send_body = malloc(user_stream->send_body_max);
         } else {
-            if (g_send_body_size_from_cdf == 1) {
-                g_send_body_size = get_random_from_cdf();
-                printf("send_request, size_from_cdf:%d\n", g_send_body_size);
-            }
             user_stream->send_body = malloc(g_send_body_size);
             memset(user_stream->send_body, 1, g_send_body_size);
         }
@@ -1984,9 +901,6 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
     }
 
     int fin = 1;
-    if (g_test_case == 4) { /* test fin_only */
-        fin = 0;
-    }
 
     if (user_stream->send_offset < user_stream->send_body_len) {
         ret = xqc_stream_send(stream, user_stream->send_body + user_stream->send_offset, user_stream->send_body_len - user_stream->send_offset, fin);
@@ -1997,15 +911,6 @@ xqc_client_stream_send(xqc_stream_t *stream, void *user_data)
         } else {
             user_stream->send_offset += ret;
             printf("xqc_stream_send offset=%"PRIu64"\n", user_stream->send_offset);
-        }
-    }
-
-    if (g_test_case == 4) { /* test fin_only */
-        if (user_stream->send_offset == user_stream->send_body_len) {
-            fin = 1;
-            usleep(200*1000);
-            ret = xqc_stream_send(stream, user_stream->send_body + user_stream->send_offset, user_stream->send_body_len - user_stream->send_offset, fin);
-            printf("xqc_stream_send sent:%zd, offset=%"PRIu64", fin=1\n", ret, user_stream->send_offset);
         }
     }
 
@@ -2092,19 +997,6 @@ xqc_client_stream_read_notify(xqc_stream_t *stream, void *user_data)
     // printf("xqc_stream_recv read:%zd, offset:%zu, fin:%d\n", read_sum, user_stream->recv_body_len, fin);
 
     /* test first frame rendering time */
-    if (g_test_case == 14 && user_stream->first_frame_time == 0 && user_stream->recv_body_len >= 98*1024) {
-        user_stream->first_frame_time = now();
-    }
-
-    /* test abnormal rate */
-    if (g_test_case == 14) {
-        xqc_msec_t tmp = now();
-        if (tmp - user_stream->last_read_time > 150*1000 && user_stream->last_read_time != 0 ) {
-            user_stream->abnormal_count++;
-            printf("\033[33m!!!!!!!!!!!!!!!!!!!!abnormal!!!!!!!!!!!!!!!!!!!!!!!!\033[0m\n");
-        }
-        user_stream->last_read_time = tmp;
-    }
 
     if (fin) {
         user_stream->recv_fin = 1;
@@ -2158,864 +1050,10 @@ xqc_client_stream_close_notify(xqc_stream_t *stream, void *user_data)
         printf(">>>>>>>> pass:%d\n", pass);
     }
 
-    /* test first frame rendering time */
-    if (g_test_case == 14) {
-        printf("first_frame_time: %"PRIu64", start_time: %"PRIu64"\n", user_stream->first_frame_time, user_stream->start_time);
-        xqc_msec_t t = user_stream->first_frame_time - user_stream->start_time + 200000 /* server-side time consumption */;
-        printf("\033[33m>>>>>>>> first_frame pass:%d time:%"PRIu64"\033[0m\n", t <= 1000000 ? 1 : 0, t);
-    }
-
-    /* test abnormal rate */
-    if (g_test_case == 14) {
-        printf("\033[33m>>>>>>>> abnormal pass:%d count:%d\033[0m\n", user_stream->abnormal_count == 0 ? 1 : 0, user_stream->abnormal_count);
-    }
     free(user_stream->send_body);
     free(user_stream->recv_body);
     free(user_stream);
     return 0;
-}
-
-int
-xqc_client_bytestream_send(xqc_h3_ext_bytestream_t *h3_bs, user_stream_t *user_stream)
-{
-    if (user_stream->start_time == 0) {
-        user_stream->start_time = now();
-    }
-    ssize_t ret = 0;
-    char content_len[10];
-
-    if (g_test_case == 302 || g_test_case == 310) {
-        //send pure fin on bytestream
-        xqc_h3_ext_bytestream_finish(h3_bs);
-        return 0;
-    }
-
-    if (g_test_case == 303) {
-        //send pure fin on bytestream
-        xqc_h3_ext_bytestream_send(h3_bs, NULL, 0, 1, g_dgram_qos_level);
-        return 0;
-    }
-
-    if (user_stream->send_body == NULL) {
-        user_stream->send_body_max = MAX_BUF_SIZE;
-        user_stream->send_body_len = g_send_body_size > user_stream->send_body_max ? user_stream->send_body_max : g_send_body_size;
-        user_stream->send_body = malloc(user_stream->send_body_len);
-        char *p = user_stream->send_body;
-        for (int i = 0; i < g_send_body_size; i++) {
-            *p++ = rand();
-        }
-
-        if (user_stream->send_body == NULL) {
-            printf("send_body malloc error\n");
-            return -1;
-        }
-    }
-
-    int fin = 1;
-    if (g_test_case == 304 || g_test_case == 305 
-        || g_test_case == 311 || g_test_case == 312 
-        || g_test_case == 313 || g_test_case == 314) {
-        //do not send fin with data
-        fin = 0;
-        // will send fin in a timer
-    }
-
-    /* send body */
-    if (user_stream->send_offset < user_stream->send_body_len) {
-        ret = xqc_h3_ext_bytestream_send(h3_bs, user_stream->send_body + user_stream->send_offset, user_stream->send_body_len - user_stream->send_offset, fin, g_dgram_qos_level);
-
-        if (ret == -XQC_EAGAIN) {
-            printf("xqc_h3_ext_bytestream_send eagain %zd\n", ret);
-            return 0;
-
-        } else if (ret < 0) {
-            printf("xqc_h3_ext_bytestream_send error %zd\n", ret);
-            return 0;
-
-        } else {
-            user_stream->snd_times++;
-            user_stream->send_offset += ret;
-            // printf("[bytestream]|send:%"PRIu64"|\n", user_stream->send_offset);
-        }
-    }
-
-    return 0;
-}
-
-int xqc_h3_ext_bytestream_create_callback(xqc_h3_ext_bytestream_t *h3_ext_bs, 
-	void *bs_user_data)
-{
-    user_stream_t *user_stream = (user_stream_t*)bs_user_data;
-    struct timeval tv;
-    if (g_test_case == 304 || g_test_case == 305) {
-        user_stream->ev_bytestream_timer = event_new(eb, -1, 0, xqc_client_bytestream_timeout_callback, user_stream);
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; //100ms
-        event_add(user_stream->ev_bytestream_timer, &tv);
-    }
-    return 0;
-}
-
-int xqc_h3_ext_bytestream_close_callback(xqc_h3_ext_bytestream_t *h3_ext_bs, 
-	void *bs_user_data)
-{
-    //print stats
-    xqc_h3_ext_bytestream_stats_t stats = xqc_h3_ext_bytestream_get_stats(h3_ext_bs);
-    user_stream_t *user_stream = (user_stream_t*)bs_user_data;
-
-    printf("[bytestream]|bytes_sent:%zu|bytes_rcvd:%zu|recv_fin:%d|snd_times:%d|rcv_times:%d|\n", stats.bytes_sent, stats.bytes_rcvd, user_stream->recv_fin, user_stream->snd_times, user_stream->rcv_times);
-
-    //check content
-    if (g_echo_check) {
-        if (user_stream->send_body && user_stream->recv_body && !memcmp(user_stream->send_body, user_stream->recv_body, user_stream->send_body_len)) {
-            printf("[bytestream]|same_content:yes|\n");
-
-        } else {
-            printf("[bytestream]|same_content:no|\n");
-        }
-    }
-
-    if (user_stream->send_body) {
-        free(user_stream->send_body);
-    }
-
-    if (user_stream->recv_body) {
-        free(user_stream->recv_body);
-    }
-
-    if (g_test_case == 304 || g_test_case == 305) {
-        if (user_stream->ev_bytestream_timer) {
-            event_free(user_stream->ev_bytestream_timer);
-        }
-    }
-
-    free(user_stream);
-
-    return 0;
-}
-
-int xqc_h3_ext_bytestream_read_callback(xqc_h3_ext_bytestream_t *h3_ext_bs, 
-	const void *data, size_t data_len, uint8_t fin, void *bs_user_data, uint64_t data_recv_time)
-{
-    user_stream_t *user_stream = (user_stream_t*)bs_user_data;
-    int ret = 0;
-
-    if (user_stream->recv_body == NULL) {
-        user_stream->recv_body = calloc(1, user_stream->send_body_len);
-        user_stream->recv_body_len = 0;
-        user_stream->recv_fin = 0;
-    }
-
-    if (data_len > 0) {
-        memcpy(user_stream->recv_body + user_stream->recv_body_len, data, data_len);
-        user_stream->recv_body_len += data_len;
-    }
-
-    if (!user_stream->recv_fin) {
-        user_stream->recv_fin = fin;
-    }
-
-    if (g_test_case == 311 || g_test_case == 312 || g_test_case == 313 || g_test_case == 314) {
-        user_stream->send_offset = 0;
-        user_stream->recv_body_len = 0;
-        user_stream->recv_fin = 0;
-        user_stream->send_body_len = 1000;
-        g_test_case = 0;
-        xqc_client_bytestream_send(h3_ext_bs, user_stream);
-    }
-
-    user_stream->rcv_times++;
-
-    printf("[bytestream]|stream_id:%"PRIu64"|data_len:%zu|fin:%d|recv_time:%"PRIu64"|\n", xqc_h3_ext_bytestream_id(h3_ext_bs), data_len, fin, data_recv_time);
-
-    return 0;
-}
-
-int xqc_h3_ext_bytestream_write_callback(xqc_h3_ext_bytestream_t *h3_ext_bs, 
-	void *bs_user_data)
-{
-    user_stream_t *us = bs_user_data;
-    int ret;
-    // printf("[bytestream]|write callback|\n");
-    ret = xqc_client_bytestream_send(h3_ext_bs, us);
-    if (ret == -XQC_EAGAIN) {
-        ret = 0;
-        printf("[bytestream]|write blocked|\n");
-    }
-    return 0;
-}
-
-void
-xqc_client_request_send_fin_only(int fd, short what, void *arg)
-{
-    user_stream_t *us = (user_stream_t *)arg;
-    xqc_int_t ret = xqc_h3_request_finish(us->h3_request);
-    if (ret < 0) {
-        printf("xqc_h3_request_finish error %d\n", ret);
-
-    } else {
-        printf("xqc_h3_request_finish success\n");
-    }
-}
-
-int
-xqc_client_request_send(xqc_h3_request_t *h3_request, user_stream_t *user_stream)
-{
-    if (g_test_case == 99) {
-        xqc_h3_request_finish(h3_request);
-        return 0;
-    }
-
-    if (user_stream->start_time == 0) {
-        user_stream->start_time = now();
-    }
-    ssize_t ret = 0;
-    char content_len[10];
-
-    if (user_stream->send_body == NULL && !g_is_get /* POST */) {
-        user_stream->send_body_max = MAX_BUF_SIZE;
-        if (g_read_body) {
-            user_stream->send_body = malloc(user_stream->send_body_max);
-
-        } else {
-            if (g_send_body_size_from_cdf == 1) {
-                g_send_body_size = get_random_from_cdf();
-                printf("send_request, size_from_cdf:%d\n", g_send_body_size);
-            }
-            user_stream->send_body = malloc(g_send_body_size);
-            char *p = user_stream->send_body;
-            for (int i = 0; i < g_send_body_size; i++) {
-                *p++ = rand();
-            }
-        }
-
-        if (user_stream->send_body == NULL) {
-            printf("send_body malloc error\n");
-            return -1;
-        }
-
-        /* specified size > specified file > default size */
-        if (g_send_body_size_defined) {
-            user_stream->send_body_len = g_send_body_size;
-
-        } else if (g_read_body) {
-            ret = read_file_data(user_stream->send_body, user_stream->send_body_max, g_read_file);
-            if (ret < 0) {
-                printf("read body error\n");
-                return -1;
-
-            } else {
-                user_stream->send_body_len = ret;
-            }
-
-        } else {
-            user_stream->send_body_len = g_send_body_size;
-        }
-    }
-
-    if (g_is_get) {
-        snprintf(content_len, sizeof(content_len), "%d", 0);
-
-    } else {
-        snprintf(content_len, sizeof(content_len), "%zu", user_stream->send_body_len);
-    }
-    int header_size = 6;
-    xqc_http_header_t header[MAX_HEADER] = {
-        {
-            .name   = {.iov_base = ":method", .iov_len = 7},
-            .value  = {.iov_base = "POST", .iov_len = 4},
-            .flags  = 0,
-        },
-        {
-            .name   = {.iov_base = ":scheme", .iov_len = 7},
-            .value  = {.iov_base = g_scheme, .iov_len = strlen(g_scheme)},
-            .flags  = 0,
-        },
-        {
-            .name   = {.iov_base = "host", .iov_len = 4},
-            .value  = {.iov_base = g_host, .iov_len = strlen(g_host)},
-            .flags  = 0,
-        },
-        {
-            .name   = {.iov_base = ":path", .iov_len = 5},
-            .value  = {.iov_base = g_url_path, .iov_len = strlen(g_url_path)},
-            .flags  = 0,
-        },
-        {
-            .name   = {.iov_base = "content-type", .iov_len = 12},
-            .value  = {.iov_base = "text/plain", .iov_len = 10},
-            .flags  = 0,
-        },
-        {
-            .name   = {.iov_base = "content-length", .iov_len = 14},
-            .value  = {.iov_base = content_len, .iov_len = strlen(content_len)},
-            .flags  = 0,
-        },
-    };
-
-    if (g_mp_request_accelerate) {
-        /* set local h3 priority */
-        xqc_h3_priority_t h3_prio = {
-            .urgency = 3,
-            .incremental = 1,
-            .schedule = 1,
-            .reinject = 1,
-        };
-        xqc_h3_request_set_priority(h3_request, &h3_prio);
-
-        /* send h3 priority signals  */
-        ret = xqc_write_http_priority(&h3_prio, g_priority, 64);
-        if (ret < 0) {
-            printf("xqc_write_http_priority error %zd\n", ret);
-            return ret;
-        }
-
-        xqc_http_header_t priority_hdr = {
-            .name   = {.iov_base = "priority", .iov_len = 8},
-            .value  = {.iov_base = g_priority, .iov_len = strlen(g_priority)},
-            .flags  = 0,
-        };
-        header[header_size] = priority_hdr;
-        header_size++;
-    }
-
-    if (g_test_case == 29) {
-        memset(test_long_value, 'a', XQC_TEST_LONG_HEADER_LEN - 1);
-
-        xqc_http_header_t test_long_hdr = {
-            .name   = {.iov_base = "long_filed_line", .iov_len = 15},
-            .value  = {.iov_base = test_long_value, .iov_len = strlen(test_long_value)},
-            .flags  = 0,
-        };
-
-        header[header_size] = test_long_hdr;
-        header_size++;
-    }
-
-    if (g_test_case == 34) {
-
-        xqc_http_header_t uppercase_name_hdr = {
-            .name   = {.iov_base = "UpperCaseFiledLineName", .iov_len = 22},
-            .value  = {.iov_base = "UpperCaseFiledLineValue", .iov_len = 23},
-            .flags  = 0,
-        };
-        header[header_size] = uppercase_name_hdr;
-        header_size++;
-
-        xqc_http_header_t lowcase_start_hdr = {
-            .name   = {.iov_base = "filelineNamewithLowerCaseStart", .iov_len = 30},
-            .value  = {.iov_base = "UpperCaseFiledLineValue", .iov_len = 23},
-            .flags  = 0,
-        };
-        header[header_size] = lowcase_start_hdr;
-        header_size++;
-
-        memset(test_long_value, 'A', 1024);
-    
-        xqc_http_header_t test_long_hdr = {
-            .name   = {.iov_base = test_long_value, .iov_len = 1024},
-            .value  = {.iov_base = "header_with_long_name", .iov_len = 21},
-            .flags  = 0,
-        };
-
-        header[header_size] = test_long_hdr;
-        header_size++;
-
-        header[header_size] = lowcase_start_hdr;
-        header_size++;
-    }
-
-    if (g_header_cnt > 0) {
-        for (int i = 0; i < g_header_cnt; i++) {
-            char *pos = strchr(g_headers[i], ':');
-            if (pos == NULL) {
-                continue;
-            }
-            header[header_size].name.iov_base = g_headers[i];
-            header[header_size].name.iov_len = pos - g_headers[i];
-            header[header_size].value.iov_base = pos + 1;
-            header[header_size].value.iov_len = strlen(pos+1);
-            header[header_size].flags = 0;
-            header_size++;
-        }
-    }
-
-    while (header_size < g_header_num) {
-        int m = 0, n = 0;
-        m = rand();
-        n = rand();
-        header[header_size].name.iov_base = g_header_key;
-        header[header_size].name.iov_len = m%(MAX_HEADER_KEY_LEN - 1) + 1;
-        header[header_size].value.iov_base = g_header_value;
-        header[header_size].value.iov_len = n%(MAX_HEADER_VALUE_LEN - 1) + 1;
-        header[header_size].flags = 0;
-        header_size++;
-    }
-
-    xqc_http_headers_t headers = {
-        .headers = header,
-        .count  = header_size,
-    };
-
-    int header_only = g_is_get;
-    if (g_is_get) {
-         header[0].value.iov_base = "GET";
-         header[0].value.iov_len = sizeof("GET") - 1;
-    }
-
-    /* send header */
-    if (user_stream->header_sent == 0) {
-        if (g_test_case == 30 || g_test_case == 37 || g_test_case == 38) {
-            ret = xqc_h3_request_send_headers(h3_request, &headers, 0);
-
-        } else  {
-            ret = xqc_h3_request_send_headers(h3_request, &headers, header_only);
-        }
-
-        if (ret < 0) {
-            printf("xqc_h3_request_send_headers error %zd\n", ret);
-            return ret;
-
-        } else {
-            printf("xqc_h3_request_send_headers success size=%zd\n", ret);
-            user_stream->header_sent = 1;
-        }
-
-        if (g_test_case == 30) {
-            usleep(200*1000);
-            ret = xqc_h3_request_send_headers(h3_request, &headers, header_only);
-            if (ret < 0) {
-                printf("xqc_h3_request_send_headers error %zd\n", ret);
-                return ret;
-
-            } else {
-                printf("xqc_h3_request_send_headers success size=%zd\n", ret);
-            }
-        }
-
-        if (g_test_case == 37) {
-            header_only = 1;
-            struct timeval finish = {1, 0};
-            ctx.ev_delay = event_new(eb, -1, 0, xqc_client_request_send_fin_only, user_stream);
-            event_add(ctx.ev_delay, &finish);
-
-        } else if (g_test_case == 38) {
-            header_only = 1;
-            ret = xqc_h3_request_finish(h3_request);
-            if (ret < XQC_OK) {
-                printf("xqc_h3_request_finish fail, error %zd\n", ret);
-                return ret;
-            }
-            
-        }
-    }
-
-    if (header_only) {
-        return 0;
-    }
-
-    int fin = 1;
-    if (g_test_case == 4 || g_test_case == 31 || g_test_case == 35 || g_test_case == 36) { /* test fin_only */
-        fin = 0;
-    }
-
-    if (g_test_case == 109) {
-        xqc_stream_settings_t settings = {.recv_rate_bytes_per_sec = 100000000};
-        xqc_h3_request_update_settings(h3_request, &settings);
-    }
-
-
-    /* send body */
-    if (user_stream->send_offset < user_stream->send_body_len) {
-        if (g_test_case == 49) { /* test send 4K every time */
-            do {
-                size_t data_size = user_stream->send_body_len - user_stream->send_offset < 4096 ?
-                        user_stream->send_body_len - user_stream->send_offset : 4096;
-                fin = user_stream->send_offset + data_size == user_stream->send_body_len ? 1 : 0;
-                ret = xqc_h3_request_send_body(h3_request, user_stream->send_body + user_stream->send_offset,
-                                               data_size, fin);
-                if (ret == -XQC_EAGAIN) {
-                    return 0;
-
-                } else if (ret < 0) {
-                    printf("xqc_h3_request_send_body error %zd\n", ret);
-                    return 0;
-
-                } else {
-                    user_stream->send_offset += ret;
-                    printf("xqc_h3_request_send_body sent:%zd, offset=%"PRIu64"\n", ret, user_stream->send_offset);
-                }
-            } while (user_stream->send_offset < user_stream->send_body_len);
-            goto next;
-        }
-        ret = xqc_h3_request_send_body(h3_request, user_stream->send_body + user_stream->send_offset, user_stream->send_body_len - user_stream->send_offset, fin);
-        if (ret == -XQC_EAGAIN) {
-            printf("xqc_h3_request_send_body eagain %zd\n", ret);
-            return 0;
-
-        } else if (ret < 0) {
-            printf("xqc_h3_request_send_body error %zd\n", ret);
-            return 0;
-
-        } else {
-            user_stream->send_offset += ret;
-            // mpshell
-            // printf("xqc_h3_request_send_body sent:%zd, offset=%"PRIu64"\n", ret, user_stream->send_offset);
-        }
-    }
-next:
-    /* send trailer header */
-    if (user_stream->send_offset == user_stream->send_body_len) {
-        if (g_test_case == 31) {
-            ret = xqc_h3_request_send_headers(h3_request, &headers, 1);
-            if (ret < 0) {
-                printf("xqc_h3_request_send_headers error %zd\n", ret);
-                return ret;
-
-            } else {
-                printf("xqc_h3_request_send_headers success size=%zd\n", ret);
-            }
-        }
-
-        /* no tailer header, fin only */
-        if (g_test_case == 35) {
-            struct timeval finish = {1, 0};
-            ctx.ev_delay = event_new(eb, -1, 0, xqc_client_request_send_fin_only, user_stream);
-            event_add(ctx.ev_delay, &finish);
-
-        } else if (g_test_case == 36) {
-            ret = xqc_h3_request_finish(h3_request);
-            if (ret != XQC_OK) {
-                printf("send request finish error, ret: %zd\n", ret);
-
-            } else {
-                printf("send request finish suc\n");
-            }
-        }
-    }
-
-    if (g_test_case == 4) { /* test fin_only */
-        if (user_stream->send_offset == user_stream->send_body_len) {
-            fin = 1;
-            usleep(200*1000);
-            ret = xqc_h3_request_send_body(h3_request, user_stream->send_body + user_stream->send_offset, user_stream->send_body_len - user_stream->send_offset, fin);
-            printf("xqc_h3_request_send_body sent:%zd, offset=%"PRIu64", fin=1\n", ret, user_stream->send_offset);
-        }
-    }
-
-    if (g_test_case == 50) {
-        ret = xqc_h3_request_send_body(h3_request, user_stream->send_body, 10, 0);
-        printf("xqc_h3_request_send_body sent:%zd\n", ret);
-    }
-
-    if (g_test_case == 51) {
-        ret = xqc_h3_request_send_headers(h3_request, &headers, 1);
-        printf("xqc_h3_request_send_headers sent:%zd\n", ret);
-    }
-
-    if (g_test_case == 52) {
-        ret = xqc_h3_request_finish(h3_request);
-    }
-
-
-    return 0;
-}
-
-int
-xqc_client_request_write_notify(xqc_h3_request_t *h3_request, void *user_data)
-{
-    //DEBUG;
-    ssize_t ret = 0;
-    user_stream_t *user_stream = (user_stream_t *) user_data;
-    if (g_test_case == 1) { /* reset stream */
-        xqc_h3_request_close(h3_request);
-        return 0;
-    }
-
-    if (g_test_case == 2) { /* user close connection */
-        xqc_h3_conn_close(ctx.engine, &user_stream->user_conn->cid);
-        return 0;
-    }
-
-    if (g_test_case == 3) { /* close connection with error */
-        return -1;
-    }
-
-    printf("request write notify!:%"PRIu64"\n", xqc_h3_stream_id(h3_request));
-    ret = xqc_client_request_send(h3_request, user_stream);
-    return ret;
-}
-
-int
-xqc_client_request_read_notify(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag, void *user_data)
-{
-    //DEBUG;
-    unsigned char fin = 0;
-    user_stream_t *user_stream = (user_stream_t *) user_data;
-
-    if (g_test_case == 21) { /* reset stream */
-        xqc_h3_request_close(h3_request);
-        return 0;
-    }
-
-    if (g_test_case == 28) { /* Send header after reset stream */
-        xqc_h3_request_close(h3_request);
-        xqc_http_header_t header = {
-            .name = {
-                .iov_base = "name",
-                .iov_len = sizeof("name")
-            },
-            .value = {
-                .iov_base = "value",
-                .iov_len = sizeof("value")
-            },
-        };
- 
-        xqc_http_headers_t headers = {
-            .headers = &header,
-            .count = 1,
-        };
-
-        ssize_t sent = xqc_h3_request_send_headers(h3_request, &headers, 1);
-        if (sent < 0) {
-            printf("send headers error\n");
-        }
-
-        return 0;
-    }
-
-    /* stream read notify fail */
-    if (g_test_case == 12) {
-        return -1;
-    }
-
-    if ((flag & XQC_REQ_NOTIFY_READ_HEADER) || (flag & XQC_REQ_NOTIFY_READ_TRAILER)) {
-        xqc_http_headers_t *headers;
-        headers = xqc_h3_request_recv_headers(h3_request, &fin);
-        if (headers == NULL) {
-            printf("xqc_h3_request_recv_headers error\n");
-            return -1;
-        }
-
-        for (int i = 0; i < headers->count; i++) {
-            printf("%s = %s\n", (char *)headers->headers[i].name.iov_base, (char *)headers->headers[i].value.iov_base);
-        }
-
-        user_stream->header_recvd = 1;
-
-        if (fin) {
-            /* only header, receive request completed */
-            user_stream->recv_fin = 1;
-            return 0;
-        }
-
-        /* continue to receive body */
-    }
-
-    if (flag & XQC_REQ_NOTIFY_READ_BODY) {
-
-        char buff[4096] = {0};
-        size_t buff_size = 4096;
-        int save = g_save_body;
-
-        if (save && user_stream->recv_body_fp == NULL) {
-            user_stream->recv_body_fp = fopen(g_write_file, "wb");
-            if (user_stream->recv_body_fp == NULL) {
-                printf("open error\n");
-                return -1;
-            }
-        }
-
-        if (g_echo_check && user_stream->recv_body == NULL) {
-            user_stream->recv_body = malloc(user_stream->send_body_len);
-            if (user_stream->recv_body == NULL) {
-                printf("recv_body malloc error\n");
-                return -1;
-            }
-        }
-
-        ssize_t read;
-        ssize_t read_sum = 0;
-        do {
-            read = xqc_h3_request_recv_body(h3_request, buff, buff_size, &fin);
-            if (read == -XQC_EAGAIN) {
-                break;
-
-            } else if (read < 0) {
-                printf("xqc_h3_request_recv_body error %zd\n", read);
-                return 0;
-            }
-
-            if (save && fwrite(buff, 1, read, user_stream->recv_body_fp) != read) {
-                printf("fwrite error\n");
-                return -1;
-            }
-
-            if (save) {
-                fflush(user_stream->recv_body_fp);
-            }
-
-            /* write received body to memory */
-            if (g_echo_check && user_stream->recv_body_len + read <= user_stream->send_body_len) {
-                memcpy(user_stream->recv_body + user_stream->recv_body_len, buff, read);
-            }
-
-            read_sum += read;
-            user_stream->recv_body_len += read;
-            mp_has_recved += read_sum;
-
-        } while (read > 0 && !fin);
-
-        if (flag & XQC_REQ_NOTIFY_READ_EMPTY_FIN) {
-            fin = 1;
-        }
-
-        /* close initial path */
-        if (g_test_case == 100 && !mp_has_closed && mp_has_recved >= (g_send_body_size/2)) {
-            xqc_conn_close_path(ctx.engine, &user_stream->user_conn->cid, 0);
-            mp_has_closed = 1;
-        }
-
-        /* close new path */
-        if (g_test_case == 101 && !mp_has_closed && mp_has_recved >= (g_send_body_size/2)) {
-            xqc_conn_close_path(ctx.engine, &user_stream->user_conn->cid, 1);
-            mp_has_closed = 1;
-        }
-
-        /* close all path */
-        if (g_test_case == 102 && !mp_has_closed && mp_has_recved >= (g_send_body_size/2)) {
-            xqc_conn_close_path(ctx.engine, &user_stream->user_conn->cid, 1);
-            xqc_conn_close_path(ctx.engine, &user_stream->user_conn->cid, 0);
-            mp_has_closed = 1;
-        }
-
-        // mpshell: 批量测试，无需打印
-        // printf("xqc_h3_request_recv_body read:%zd, offset:%zu, fin:%d\n", read_sum, user_stream->recv_body_len, fin);
-    }
-
-
-    if (flag & XQC_REQ_NOTIFY_READ_EMPTY_FIN) {
-        fin = 1;
-
-        printf("h3 fin only received\n");
-    }
-
-
-    if (fin) {
-        user_stream->recv_fin = 1;
-        xqc_request_stats_t stats;
-        stats = xqc_h3_request_get_stats(h3_request);
-        xqc_msec_t now_us = now();
-        printf("\033[33m>>>>>>>> request time cost:%"PRIu64" us, speed:%"PRIu64" K/s \n"
-               ">>>>>>>> send_body_size:%zu, recv_body_size:%zu \033[0m\n",
-               now_us - user_stream->start_time,
-               (stats.send_body_size + stats.recv_body_size)*1000/(now_us - user_stream->start_time),
-               stats.send_body_size, stats.recv_body_size);
-        printf("test_result_speed: %"PRIu64" K/s. request_cnt: %d.\n", (stats.send_body_size + stats.recv_body_size)*1000/(now_us - user_stream->start_time), g_req_cnt);
-
-        printf("[rr_benchmark]|request_time:%"PRIu64"|"
-               "request_size:%zu|response_size:%zu|\n",
-               now_us - user_stream->start_time,
-               user_stream->send_body_len, user_stream->recv_body_len);
-        /* write to eval file */
-        /*{
-            FILE* fp = NULL;
-            fp = fopen("eval_result.txt", "a+");
-            if (fp == NULL) {
-                exit(1);
-            }
-
-            fprintf(fp, "recv_size: %lu; cost_time: %lu\n", stats.recv_body_size, (uint64_t)((now_us - user_stream->start_time)/1000));
-            fclose(fp);
-
-            exit(0);
-        }*/
-
-    }
-    return 0;
-}
-
-int
-xqc_client_request_close_notify(xqc_h3_request_t *h3_request, void *user_data)
-{
-    DEBUG;
-    user_stream_t *user_stream = (user_stream_t *)user_data;
-    user_conn_t *user_conn = user_stream->user_conn;
-    client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
-
-    xqc_request_stats_t stats;
-    stats = xqc_h3_request_get_stats(h3_request);
-    printf("send_body_size:%zu, recv_body_size:%zu, send_header_size:%zu, recv_header_size:%zu, recv_fin:%d, err:%d, "
-            "mp_state:%d, cellular_send_weight:%.2f, cellular_recv_weight:%.2f, stream_info:%s\n",
-           stats.send_body_size, stats.recv_body_size,
-           stats.send_header_size, stats.recv_header_size,
-           user_stream->recv_fin, stats.stream_err,
-           stats.mp_state,
-           stats.mp_standby_path_send_weight, stats.mp_standby_path_recv_weight,
-           stats.stream_info);
-
-    if (g_echo_check) {
-        int pass = 0;
-        if (user_stream->recv_fin && user_stream->send_body_len == user_stream->recv_body_len
-            && memcmp(user_stream->send_body, user_stream->recv_body, user_stream->send_body_len) == 0)
-        {
-            pass = 1;
-
-            /* large data read once for all */
-            if (user_stream->send_body_len >= 1024 * 1024 && user_stream->body_read_notify_cnt == 1) {
-                pass = 0;
-                printf("large body received once for all");
-            }
-        }
-        printf(">>>>>>>> pass:%d\n", pass);
-    }
-
-    free(user_stream->send_body);
-    free(user_stream->recv_body);
-    free(user_stream);
-
-    if (g_req_cnt < g_req_max) {
-        user_stream = calloc(1, sizeof(user_stream_t));
-        user_stream->user_conn = user_conn;
-        user_stream->h3_request = xqc_h3_request_create(p_ctx->engine, &user_conn->cid, NULL, user_stream);
-        if (user_stream->h3_request == NULL) {
-            printf("xqc_h3_request_create error\n");
-            free(user_stream);
-            return 0;
-        }
-
-        /* close initial path */
-        if (g_test_case == 105 && !mp_has_closed) {
-            xqc_conn_close_path(p_ctx->engine, &user_stream->user_conn->cid, 0);
-            mp_has_closed = 1;
-        }
-
-        /* close new path */
-        if (g_test_case == 106 && !mp_has_closed) {
-            xqc_conn_close_path(p_ctx->engine, &user_stream->user_conn->cid, 1);
-            mp_has_closed = 1;
-        }
-
-        printf("***** xqc_client_request_send\n");
-        xqc_client_request_send(user_stream->h3_request, user_stream);
-        xqc_engine_main_logic(p_ctx->engine);
-        g_req_cnt++;
-    }
-    return 0;
-}
-
-void
-xqc_client_request_closing_notify(xqc_h3_request_t *h3_request, 
-    xqc_int_t err, void *h3s_user_data)
-{
-    user_stream_t *user_stream = (user_stream_t *)h3s_user_data;
-
-    printf("***** request closing notify triggered\n");
 }
 
 void
@@ -3023,11 +1061,7 @@ xqc_client_socket_write_handler(user_conn_t *user_conn)
 {
     DEBUG
     client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
+    p_ctx = &ctx;
     xqc_conn_continue_send(p_ctx->engine, &user_conn->cid);
 }
 
@@ -3045,11 +1079,7 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
     int i;
 
     client_ctx_t *p_ctx;
-    if (g_test_qch_mode) {
-        p_ctx = user_conn->ctx;
-    } else {
-        p_ctx = &ctx;
-    }
+    p_ctx = &ctx;
 
     for (i = 0; i < g_multi_interface_cnt; i++) {
         path = &g_client_path[i];
@@ -3159,39 +1189,6 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
 
         if (TEST_DROP) continue;
 
-        if (g_test_case == 6) { /* socket recv fail */
-            g_test_case = -1;
-            break;
-        }
-
-        if (g_test_case == 8) { /* packet with wrong cid */
-            g_test_case = -1;
-            recv_size = sizeof(XQC_TEST_SHORT_HEADER_PACKET_A) - 1;
-            memcpy(packet_buf, XQC_TEST_SHORT_HEADER_PACKET_A, recv_size);
-        }
-
-        static char copy[XQC_PACKET_TMP_BUF_LEN];
-
-        if (g_test_case == 9) { /* duplicate packet */
-            memcpy(copy, packet_buf, recv_size);
-            again:;
-        }
-
-        if (g_test_case == 10) { /* illegal packet */
-            g_test_case = -1;
-            recv_size = sizeof(XQC_TEST_SHORT_HEADER_PACKET_B) - 1;
-            memcpy(packet_buf, XQC_TEST_SHORT_HEADER_PACKET_B, recv_size);
-        }
-
-        /* amplification limit */
-        if (g_test_case == 25) {
-            static int loss_num = 0;
-            loss_num++;
-            /* continuous loss to make server at amplification limit */
-            if (loss_num >= 1 && loss_num <= 10) {
-                continue;
-            }
-        }
 #ifdef XQC_NO_PID_PACKET_PROCESS
         ret = xqc_engine_packet_process(p_ctx->engine, packet_buf, recv_size,
                                       user_conn->local_addr, user_conn->local_addrlen,
@@ -3206,12 +1203,6 @@ xqc_client_socket_read_handler(user_conn_t *user_conn, int fd)
         if (ret != XQC_OK) {
             printf("xqc_client_read_handler: packet process err, ret: %d\n", ret);
             return;
-        }
-
-        if (g_test_case == 9) { /* duplicate packet */
-            g_test_case = -1;
-            memcpy(packet_buf, copy, recv_size);
-            goto again;
         }
 
     } while (recv_size > 0);
@@ -3259,52 +1250,6 @@ xqc_client_engine_callback(int fd, short what, void *arg)
     xqc_engine_main_logic(ctx->engine);
 }
 
-static void
-xqc_client_abs_timeout_callback(int fd, short what, void *arg)
-{
-    user_conn_t *user_conn = (user_conn_t *) arg;
-    int rc;
-    printf("[qperf]|ts:%"PRIu64"|test_end|\n", now());
-    printf("xqc_client_abs_timeout_callback | forced conn_close\n");
-    rc = xqc_conn_close(ctx.engine, &user_conn->cid);
-    if (rc) {
-        printf("xqc_conn_close error\n");
-        return;
-    }
-}
-
-static void
-xqc_client_bytestream_timeout_callback(int fd, short what, void *arg)
-{
-    user_stream_t *user_stream = (user_stream_t *) arg;
-    int rc = 0;
-    printf("xqc_client_bytestream_timeout_callback\n");
-    if (user_stream->send_offset >= (user_stream->send_body_len)) {
-        rc = 1;
-    }
-    if (g_test_case == 304) {
-        if (rc == 1) {
-            printf("xqc_client_bytestream_timeout_callback send fin\n");
-            xqc_h3_ext_bytestream_finish(user_stream->h3_ext_bs);
-        } else {
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 100000;
-            event_add(user_stream->ev_bytestream_timer, &tv);
-        }
-        
-    } else if (g_test_case == 305) {
-        if (rc == 1) {
-            printf("xqc_client_bytestream_timeout_callback close stream\n");
-            xqc_h3_ext_bytestream_close(user_stream->h3_ext_bs);
-        } else {
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 100000;
-            event_add(user_stream->ev_bytestream_timer, &tv);
-        }
-    }
-}
 
 static void xqc_client_timeout_multi_process_callback(int fd, short what, void *arg)
 {
@@ -3320,33 +1265,6 @@ static void xqc_client_timeout_multi_process_callback(int fd, short what, void *
     ctx->cur_conn_num--;
 
     printf("xqc_conn_close, %d connetion rest\n", ctx->cur_conn_num);
-}
-
-static void
-xqc_client_request_callback(int fd, short what, void *arg)
-{
-    user_conn_t *user_conn = (user_conn_t *) arg;
-    int rc;
-    client_ctx_t *ctx = user_conn->ctx;
-
-    printf("--- xqc_client_request_callback\n");
-
-    user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-    user_stream->user_conn = user_conn;
-    if (user_conn->h3 == 0 || user_conn->h3 == 2) {
-        user_stream->h3_request = xqc_h3_request_create(ctx->engine, &user_conn->cid, NULL, user_stream);
-        if (user_stream->h3_request == NULL) {
-            printf("xqc_h3_request_create error\n");
-            return;
-        }
-
-        xqc_client_request_send(user_stream->h3_request, user_stream);
-    }
-
-    struct timeval tv;
-    tv.tv_sec = 10;
-    tv.tv_usec = 0;
-    int ret = event_add(user_conn->ev_request, &tv);
 }
 
 static void
@@ -3379,42 +1297,8 @@ xqc_client_timeout_callback(int fd, short what, void *arg)
         return;
     }
 
-    //Test case 15: testing restart from idle
-    if (restart_after_a_while && g_test_case == 15) {
-        restart_after_a_while--;
-        //we don't care the memory leak caused by user_stream. It's just for one-shot testing. :D
-        user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-        memset(user_stream, 0, sizeof(user_stream_t));
-        user_stream->user_conn = user_conn;
-        printf("gtest 15: restart from idle!\n");
-        user_stream->stream = xqc_stream_create(ctx.engine, &(user_conn->cid), NULL, user_stream);
-        if (user_stream->stream == NULL) {
-            printf("xqc_stream_create error\n");
-            goto conn_close;
-        }
-        xqc_client_stream_send(user_stream->stream, user_stream);
-        struct timeval tv;
-        tv.tv_sec = g_conn_timeout;
-        tv.tv_usec = 0;
-        event_add(user_conn->ev_timeout, &tv);
-        printf("scheduled a new stream request\n");
-        return;
-    }
-
 conn_close:
-    if (g_send_dgram && g_echo_check) {
-        if (g_test_case == 206 && g_no_crypt) {
-            // swap the first & 2nd dgram
-            printf("%zu %zu\n", dgram1_size, dgram2_size);
-            if (dgram1_size && dgram2_size) {
-                //printf("%x %x\n", user_conn->dgram_blk->recv_data[0], user_conn->dgram_blk->recv_data[dgram1_size]);
-                memcpy(sock_op_buffer, user_conn->dgram_blk->recv_data, dgram1_size);
-                memmove(user_conn->dgram_blk->recv_data, user_conn->dgram_blk->recv_data + dgram1_size, dgram2_size);
-                memcpy(user_conn->dgram_blk->recv_data + dgram2_size, sock_op_buffer, dgram1_size);
-            }
-        }
-        printf("[dgram]|echo_check|same_content:%s|\n", !memcmp(user_conn->dgram_blk->data, user_conn->dgram_blk->recv_data, user_conn->dgram_blk->data_len) ? "yes" : "no");
-    }
+
     printf("xqc_client_timeout_callback | conn_close\n");
     rc = xqc_conn_close(ctx.engine, &user_conn->cid);
     if (rc) {
@@ -3424,153 +1308,6 @@ conn_close:
     //event_base_loopbreak(eb);
 }
 
-
-static void
-xqc_client_path_callback(int fd, short what, void *arg)
-{
-    printf("***** on_path_debug_callback\n");
-    user_conn_t *user_conn = (user_conn_t *) arg;
-
-    // 判断conn状态
-    // TODO
-    if (g_test_case == 110) {
-        g_test_case = -1;
-    }
-
-    int b_add_path = 0;
-
-    for (int i = 0; i < g_multi_interface_cnt; i++) {
-        if (g_client_path[i].is_in_used == 1) {
-            continue;
-        }
-        b_add_path = 1;
-        
-        uint64_t path_id = 0;
-        int ret = xqc_conn_create_path(ctx.engine, &(user_conn->cid), &path_id, 0);
-        
-        if (ret < 0) {
-            printf("not support mp, xqc_conn_create_path err = %d\n", ret);
-            xqc_client_set_path_debug_timer(user_conn);
-            return;
-        }
-
-        printf("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
-        g_client_path[i].path_id = path_id;
-        g_client_path[i].is_in_used = 1;
-
-        xqc_engine_main_logic(ctx.engine);
-        xqc_client_set_path_debug_timer(user_conn);
-    }
-
-    if (b_add_path == 0) {
-        static int base = 0;
-        int path_index = rand() % 2;
-        base++;
-        printf("***** remove a path. index: %d, path_id: %" PRIu64 ". now:%"PRIu64"\n", path_index, g_client_path[path_index].path_id, now());
-        xqc_conn_close_path(ctx.engine, &user_conn->cid, g_client_path[path_index].path_id);
-        xqc_engine_main_logic(ctx.engine);
-        // printf("***** finish call. now:%"PRIu64"\n", now());
-    }
-}
-
-static void 
-xqc_client_epoch_callback(int fd, short what, void *arg)
-{
-    user_conn_t *user_conn = (user_conn_t *) arg;
-    int ret;
-
-    g_cur_epoch++;
-    printf("|xqc_client_epoch_callback|epoch:%d|\n", g_cur_epoch);
-
-    if (g_send_dgram) {
-        if (user_conn->h3 == 1) {
-            xqc_client_datagram_send(user_conn);
-
-        } else if (user_conn->h3 == 2) {
-            xqc_client_h3_ext_datagram_send(user_conn);
-        }
-
-    } else {
-        for (int i = 0; i < g_req_paral; i++) {
-            g_req_cnt++;
-            user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-            user_stream->user_conn = user_conn;
-            user_stream->last_recv_log_time = now();
-            user_stream->recv_log_bytes = 0;
-            if (user_conn->h3 == 0 || user_conn->h3 == 2) {
-                user_stream->h3_request = xqc_h3_request_create(ctx.engine, &user_conn->cid, NULL, user_stream);
-                if (user_stream->h3_request == NULL) {
-                    printf("xqc_h3_request_create error\n");
-                    continue;
-                }
-                xqc_client_request_send(user_stream->h3_request, user_stream);
-            } else {
-                user_stream->stream = xqc_stream_create(ctx.engine, &user_conn->cid, NULL, user_stream);
-                if (user_stream->stream == NULL) {
-                    printf("xqc_stream_create error\n");
-                    continue;
-                }
-                xqc_client_stream_send(user_stream->stream, user_stream);
-            }
-        }
-    }
-
-    if (g_mp_ping_on) {
-        if (user_conn->h3 == 1) {
-            xqc_conn_send_ping(ctx.engine, &user_conn->cid, NULL);
-            xqc_conn_send_ping(ctx.engine, &user_conn->cid, &g_ping_id);
-
-        } else {
-            xqc_h3_conn_send_ping(ctx.engine, &user_conn->cid, NULL);
-            xqc_h3_conn_send_ping(ctx.engine, &user_conn->cid, &g_ping_id);
-        }
-    }
-
-    if (g_test_case == 107 && !g_recovery) {
-        /* freeze the first path */
-        ret = xqc_conn_mark_path_frozen(ctx.engine, &(user_conn->cid), 0);
-        if (ret < 0) {
-            printf("xqc_conn_mark_path_frozen err = %d\n", ret);
-        }
-        g_recovery = g_cur_epoch + 2;
-    }
-
-    if (g_test_case == 108 && !g_recovery) {
-        /* freeze the second path */
-        ret = xqc_conn_mark_path_frozen(ctx.engine, &(user_conn->cid), 1);
-        if (ret < 0) {
-            printf("xqc_conn_mark_path_frozen err = %d\n", ret);
-        }
-        g_recovery = g_cur_epoch + 2;
-    }
-
-    if (g_test_case == 107 && g_recovery == g_cur_epoch) {
-        g_test_case = -1;
-        /* freeze the first path */
-        ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), 0);
-        if (ret < 0) {
-            printf("xqc_conn_mark_path_standby err = %d\n", ret);
-        }
-    }
-
-    if (g_test_case == 108 && g_recovery == g_cur_epoch) {
-        g_test_case = -1;
-        /* freeze the second path */
-        ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), 1);
-        if (ret < 0) {
-            printf("xqc_conn_mark_path_standby err = %d\n", ret);
-        }
-    }
-
-    if (g_cur_epoch < g_epoch) {
-        struct timeval tv;
-        tv.tv_sec = g_epoch_timeout / 1000000;
-        tv.tv_usec = g_epoch_timeout % 1000000;
-        event_add(user_conn->ev_epoch, &tv);
-    }
-    
-    return;
-}
 
 int
 xqc_client_open_log_file(void *engine_user_data)
@@ -3692,239 +1429,30 @@ xqc_client_ready_to_create_path(const xqc_cid_t *cid,
         return;
     }
 
-    if (g_test_case != 110) {
-        for (int i = 0; i < g_multi_interface_cnt; i++) {
-            if (g_client_path[i].is_in_used == 1) {
-                continue;
-            }
-        
-            int ret = xqc_conn_create_path(ctx.engine, &(user_conn->cid), &path_id, 0);
-
-            if (ret < 0) {
-                printf("not support mp, xqc_conn_create_path err = %d\n", ret);
-                return;
-            }
-
-            printf("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
-            g_client_path[i].path_id = path_id;
-            g_client_path[i].is_in_used = 1;
-
-            if (g_test_case == 104) {
-                ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), 0);
-                if (ret < 0) {
-                    printf("xqc_conn_mark_path_standby err = %d\n", ret);
-                }
-                ret = xqc_conn_mark_path_available(ctx.engine, &(user_conn->cid), 1);
-                if (ret < 0) {
-                    printf("xqc_conn_mark_path_available err = %d\n", ret);
-                }
-            }
-
-            if (g_mp_backup_mode) {
-                ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), path_id);
-                if (ret < 0) {
-                    printf("xqc_conn_mark_path_standby err = %d\n", ret);
-                }
-            }
-
-            xqc_client_set_path_debug_timer(user_conn);
-
+    for (int i = 0; i < g_multi_interface_cnt; i++) {
+        if (g_client_path[i].is_in_used == 1) {
+            continue;
         }
-        
-    } else {
-        xqc_client_set_path_debug_timer(user_conn);
-    }
-}
+    
+        int ret = xqc_conn_create_path(ctx.engine, &(user_conn->cid), &path_id, 0);
 
-static void xqc_client_concurrent_callback(int fd, short what, void *arg){
-    client_ctx_t *ctx = (client_ctx_t *)arg;
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = (1000000/g_conn_num );
-    int i = 0;
-
-    xqc_h3_callbacks_t h3_cbs = {
-        .h3c_cbs = {
-            .h3_conn_create_notify = xqc_client_h3_conn_create_notify,
-            .h3_conn_close_notify = xqc_client_h3_conn_close_notify,
-            .h3_conn_handshake_finished = xqc_client_h3_conn_handshake_finished,
-            .h3_conn_ping_acked = xqc_client_h3_conn_ping_acked_notify,
-        },
-        .h3r_cbs = {
-            .h3_request_close_notify = xqc_client_request_close_notify,
-            .h3_request_read_notify = xqc_client_request_read_notify,
-            .h3_request_write_notify = xqc_client_request_write_notify,
-            .h3_request_closing_notify = xqc_client_request_closing_notify,
-        }
-    };
-
-    /* init http3 context */
-    int ret = xqc_h3_ctx_init(ctx->engine, &h3_cbs);
-    if (ret != XQC_OK) {
-        printf("init h3 context error, ret: %d\n", ret);
-        return;
-    }
-
-    /* register transport callbacks */
-    xqc_app_proto_callbacks_t ap_cbs = {
-        .conn_cbs = {
-            .conn_create_notify = xqc_client_conn_create_notify,
-            .conn_close_notify = xqc_client_conn_close_notify,
-            .conn_handshake_finished = xqc_client_conn_handshake_finished,
-            .conn_ping_acked = xqc_client_conn_ping_acked_notify,
-        },
-        .stream_cbs = {
-            .stream_write_notify = xqc_client_stream_write_notify,
-            .stream_read_notify = xqc_client_stream_read_notify,
-            .stream_close_notify = xqc_client_stream_close_notify,
-        }
-    };
-
-    xqc_engine_register_alpn(ctx->engine, XQC_ALPN_TRANSPORT, 9, &ap_cbs);
-
-
-    if (g_conn_count < g_max_conn_num) {
-        event_add(ctx->ev_conc, &tv);
-        user_conn_t *user_conn = xqc_client_user_conn_multi_process_create(ctx, g_server_addr, g_server_port, g_transport);
-        
-        if (user_conn == NULL) {
-            printf("xqc_client_user_conn_multi_process_create error\n");
+        if (ret < 0) {
+            printf("not support mp, xqc_conn_create_path err = %d\n", ret);
             return;
         }
 
-        xqc_conn_ssl_config_t conn_ssl_config;
-        memset(&conn_ssl_config, 0, sizeof(conn_ssl_config));
+        printf("***** create a new path. index: %d, path_id: %" PRIu64 "\n", i, path_id);
+        g_client_path[i].path_id = path_id;
+        g_client_path[i].is_in_used = 1;
 
-        if (g_verify_cert) {
-            conn_ssl_config.cert_verify_flag |= XQC_TLS_CERT_FLAG_NEED_VERIFY;
-            if (g_verify_cert_allow_self_sign) {
-                conn_ssl_config.cert_verify_flag |= XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED;
+        if (g_mp_backup_mode) {
+            ret = xqc_conn_mark_path_standby(ctx.engine, &(user_conn->cid), path_id);
+            if (ret < 0) {
+                printf("xqc_conn_mark_path_standby err = %d\n", ret);
             }
         }
-
-        conn_ssl_config.session_ticket_data = NULL;
-        conn_ssl_config.transport_parameter_data = NULL;
-
-        const xqc_cid_t *cid;
-        if (user_conn->h3 == 0) {
-            cid = xqc_h3_connect(ctx->engine, g_conn_settings, user_conn->token, user_conn->token_len,
-                             g_host, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                             user_conn->peer_addrlen, user_conn);
-        } else if (user_conn->h3 == 2) {
-            cid = xqc_connect(ctx->engine, g_conn_settings, user_conn->token, user_conn->token_len,
-                             g_host, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                             user_conn->peer_addrlen, XQC_DEFINED_ALPN_H3_EXT, user_conn);
-        } else {
-            cid = xqc_connect(ctx->engine, g_conn_settings, user_conn->token, user_conn->token_len,
-                          "127.0.0.1", g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                          user_conn->peer_addrlen, XQC_ALPN_TRANSPORT, user_conn);
-
-            if (cid == NULL) {
-                printf("xqc_connect error\n");
-                return;
-            }
-        }
-        g_conn_count++;
-        ctx->cur_conn_num++;
-        memcpy(&user_conn->cid, cid, sizeof(*cid));
-
-        while (user_conn->cur_stream_num < g_req_paral) {
-        
-            user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-            user_stream->user_conn = user_conn;
-            if (user_conn->h3 == 0 || user_conn->h3 == 2) {
-                user_stream->h3_request = xqc_h3_request_create(ctx->engine, cid, NULL, user_stream);
-                if (user_stream->h3_request == NULL) {
-                    printf("xqc_h3_request_create error\n");
-                    continue;
-                }
-
-                xqc_client_request_send(user_stream->h3_request, user_stream);
-
-            } 
-            user_conn->cur_stream_num++;
-        }
-
-
-    }
-    return;
-}
-
-
-#define XQC_CID_ARRAY_SIZE 10
-char * g_cid_array[XQC_CID_ARRAY_SIZE] = {"123","234","345","456","567","678","789","890","901","012"};
-
-#define XQC_FIRST_OCTET 1
-static ssize_t
-xqc_qch_ddos_cid_generate(const xqc_cid_t *ori_cid, uint8_t *cid_buf, size_t cid_buflen, void *engine_user_data)
-{
-
-    ssize_t              cid_buf_index = 0, i;
-    cid_buf[0] = 0;
-    cid_buf_index += XQC_FIRST_OCTET;
-    if (g_random_cid == 0) {
-        memcpy(cid_buf + cid_buf_index, "123", 3);
-        cid_buf_index += 3;
-        return cid_buf_index;
-    } else {
-        if (g_random_cid > XQC_CID_ARRAY_SIZE) {
-            g_random_cid = XQC_CID_ARRAY_SIZE;
-        }
-        int index = random()%g_random_cid;
-        printf("%s\n", g_cid_array[index]);
-        memcpy(cid_buf + cid_buf_index, g_cid_array[index], 3);
-        cid_buf_index += 3;
-        return cid_buf_index;
     }
 }
-
-
-client_ctx_t * client_create_ctx(xqc_engine_ssl_config_t *engine_ssl_config,
-    xqc_transport_callbacks_t *tcbs, xqc_config_t *config)
-{
-    client_ctx_t * ctx = malloc(sizeof(client_ctx_t));
-    memset(ctx, 0, sizeof(client_ctx_t));
-    
-    xqc_client_open_keylog_file(ctx);
-    xqc_client_open_log_file(ctx);
-
-    xqc_engine_callback_t callback = {
-        .set_event_timer = xqc_client_set_event_timer, /* call xqc_engine_main_logic when the timer expires */
-        .log_callbacks = {
-            .xqc_log_write_err = xqc_client_write_log,
-            .xqc_log_write_stat = xqc_client_write_log,
-        },
-        .keylog_cb = xqc_keylog_cb,
-        .cid_generate_cb = xqc_qch_ddos_cid_generate, /* 设置cid 生产的回调函数 */
-    };
-
-    ctx->eb = event_base_new();
-
-    if(ctx->eb == NULL){
-        return NULL;
-    }
-    ctx->ev_engine = event_new(ctx->eb, -1, 0, xqc_client_engine_callback, ctx);
-    if(ctx->ev_engine == NULL){
-        return NULL;
-    }
-    ctx->ev_conc = event_new(ctx->eb, -1, 0, xqc_client_concurrent_callback, ctx);
-    if(ctx->ev_conc == NULL){
-        return NULL;
-    }
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    event_add(ctx->ev_conc, &tv);
-
-    ctx->engine = xqc_engine_create(XQC_ENGINE_CLIENT, config, engine_ssl_config,
-                                   &callback, tcbs, ctx);
-
-    if(ctx->engine == NULL){
-        return NULL;
-    }
-    return ctx;
-}
-
 
 
 void usage(int argc, char *argv[]) {
@@ -4097,19 +1625,10 @@ int main(int argc, char *argv[]) {
         case 's': /* Body size to send. */
             printf("option send_body_size :%s\n", optarg);
             g_send_body_size = atoi(optarg);
-            if (g_send_body_size == 0) {
-                if (load_cdf(optarg) != -1) {
-                    g_send_body_size_from_cdf = 1;
-                } else {
-                    printf("the cdf file of send_body_size does not exist: %s\n", optarg);
-                    exit(0);
-                }
-            } else {
-                g_send_body_size_defined = 1;
-                if (g_send_body_size > MAX_BUF_SIZE) {
-                    printf("max send_body_size :%d\n", MAX_BUF_SIZE);
-                    exit(0);
-                }
+            g_send_body_size_defined = 1;
+            if (g_send_body_size > MAX_BUF_SIZE) {
+                printf("max send_body_size :%d\n", MAX_BUF_SIZE);
+                exit(0);
             }
             break;
         case 'F':
@@ -4328,10 +1847,6 @@ int main(int argc, char *argv[]) {
     memset(g_header_value, 'v', sizeof(g_header_value));
     memset(&ctx, 0, sizeof(ctx));
 
-    if (g_test_case == 44) {
-        xqc_log_enable(XQC_FALSE);
-    }
-
     xqc_client_open_keylog_file(&ctx);
     xqc_client_open_log_file(&ctx);
 
@@ -4340,10 +1855,6 @@ int main(int argc, char *argv[]) {
     /* client does not need to fill in private_key_file & cert_file */
     engine_ssl_config.ciphers = XQC_TLS_CIPHERS;
     engine_ssl_config.groups = XQC_TLS_GROUPS;
-
-    if (g_test_case == 27) {
-        engine_ssl_config.ciphers = "TLS_CHACHA20_POLY1305_SHA256";
-    }
 
     xqc_engine_callback_t callback = {
         .set_event_timer = xqc_client_set_event_timer, /* call xqc_engine_main_logic when the timer expires */
@@ -4439,16 +1950,6 @@ int main(int argc, char *argv[]) {
 
     xqc_stream_settings_t stream_settings = { .recv_rate_bytes_per_sec = 0 };
 
-    if (g_test_case == 109) {
-        conn_settings.enable_stream_rate_limit = 1;
-        stream_settings.recv_rate_bytes_per_sec = 500000;
-    }
-    
-    if (g_test_case == 400) {
-        //low_delay
-        conn_settings = xqc_conn_get_conn_settings_template(XQC_CONN_SETTINGS_LOW_DELAY);
-    }
-
     if (g_pmtud_on) {
         conn_settings.enable_pmtud = 1;
     }
@@ -4458,33 +1959,11 @@ int main(int argc, char *argv[]) {
     conn_settings.max_datagram_frame_size = g_max_dgram_size;
     conn_settings.enable_multipath = g_enable_multipath;
 
-    if (g_test_case == 208) {
-        conn_settings.datagram_redundancy = 1;
-    }
-
-    if (g_test_case == 209) {
-        conn_settings.datagram_redundant_probe = 30000;
-    }
-
-    if (g_test_case == 210) {
-        conn_settings.datagram_redundancy = 2;
-    }
-
-    if (g_test_case == 211) {
-        conn_settings.datagram_redundancy = 2;
-        conn_settings.datagram_redundant_probe = 30000;
-    }
-
     g_conn_settings = &conn_settings;
 
     xqc_config_t config;
     if (xqc_engine_get_default_config(&config, XQC_ENGINE_CLIENT) < 0) {
         return -1;
-    }
-
-
-    if (transport == 2 && g_test_case != 315) {
-        config.enable_h3_ext = 1;
     }
 
     switch(c_log_level) {
@@ -4495,74 +1974,7 @@ int main(int argc, char *argv[]) {
         case 'd': config.cfg_log_level = XQC_LOG_DEBUG; break;
         default: config.cfg_log_level = XQC_LOG_DEBUG;
     }
-    
-    /* test different cid_len */
-    if (g_test_case == 13) {
-        config.cid_len = XQC_MAX_CID_LEN;
-    }
 
-    /* check draft-29 version */
-    if (g_test_case == 17) {
-        conn_settings.proto_version = XQC_IDRAFT_VER_29;
-    }
-
-#if defined(XQC_SUPPORT_SENDMMSG)
-    if (g_test_case == 20) { /* test sendmmsg */
-        printf("test sendmmsg!\n");
-        tcbs.write_mmsg = xqc_client_write_mmsg;
-        tcbs.write_mmsg_ex = xqc_client_mp_write_mmsg;
-        config.sendmmsg_on = 1;
-    }
-#endif
-
-    if (g_test_case == 24) {
-        conn_settings.idle_time_out = 10000;
-    }
-
-    /* test spurious loss detect */
-    if (g_test_case == 26) {
-        conn_settings.spurious_loss_detect_on = 1;
-    }
-
-    /* test key update */
-    if (g_test_case == 40) {
-        conn_settings.keyupdate_pkt_threshold = 30;
-    }
-
-    if (g_test_case == 42) {
-        conn_settings.max_pkt_out_size = 1400;
-    }
-
-    if (g_test_case == 201) {
-        conn_settings.max_pkt_out_size = 1216;
-    }
-
-    if (g_test_qch_mode) {
-        pid_t pid;
-        int i;
-        for (i = 1; i < g_process_num; i++) {   
-            pid = fork();
-            if (pid < 0) {
-                printf("error create process, current process num:%d, need create process:%d\n", i+1, g_process_num);
-            } else if (pid == 0) {
-                printf("Current Pid = %d , Parent Pid = %d\n", getpid(), getppid());
-                break;
-            } else {
-                sleep(1);
-            }
-        }
-
-        client_ctx_t * ctx = NULL;
-        ctx = client_create_ctx(&engine_ssl_config, &tcbs, &config);
-
-        if(ctx == NULL){
-            printf("ctx create error\n");
-            exit(0);
-        }
-
-        event_base_dispatch(ctx->eb);
-        return 0;    
-    }
 
 
     eb = event_base_new();
@@ -4576,40 +1988,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    xqc_h3_callbacks_t h3_cbs = {
-        .h3c_cbs = {
-            .h3_conn_create_notify = xqc_client_h3_conn_create_notify,
-            .h3_conn_close_notify = xqc_client_h3_conn_close_notify,
-            .h3_conn_handshake_finished = xqc_client_h3_conn_handshake_finished,
-            .h3_conn_ping_acked = xqc_client_h3_conn_ping_acked_notify,
-        },
-        .h3r_cbs = {
-            .h3_request_close_notify = xqc_client_request_close_notify,
-            .h3_request_read_notify = xqc_client_request_read_notify,
-            .h3_request_write_notify = xqc_client_request_write_notify,
-            .h3_request_closing_notify = xqc_client_request_closing_notify,
-        },
-        .h3_ext_dgram_cbs = {
-            .dgram_read_notify = xqc_client_h3_ext_datagram_read_callback,
-            .dgram_write_notify = xqc_client_h3_ext_datagram_write_callback,
-            .dgram_acked_notify = xqc_client_h3_ext_datagram_acked_callback,
-            .dgram_lost_notify = xqc_client_h3_ext_datagram_lost_callback,
-            .dgram_mss_updated_notify = xqc_client_h3_ext_datagram_mss_updated_callback,
-        },
-        .h3_ext_bs_cbs = {
-            .bs_read_notify = xqc_h3_ext_bytestream_read_callback,
-            .bs_write_notify = xqc_h3_ext_bytestream_write_callback,
-            .bs_create_notify = xqc_h3_ext_bytestream_create_callback,
-            .bs_close_notify = xqc_h3_ext_bytestream_close_callback,
-        },
-    };
-
-    /* init http3 context */
-    int ret = xqc_h3_ctx_init(ctx.engine, &h3_cbs);
-    if (ret != XQC_OK) {
-        printf("init h3 context error, ret: %d\n", ret);
-        return ret;
-    }
+    int ret;
 
     /* register transport callbacks */
     xqc_app_proto_callbacks_t ap_cbs = {
@@ -4623,19 +2002,10 @@ int main(int argc, char *argv[]) {
             .stream_write_notify = xqc_client_stream_write_notify,
             .stream_read_notify = xqc_client_stream_read_notify,
             .stream_close_notify = xqc_client_stream_close_notify,
-        },
-        .dgram_cbs = {
-            .datagram_write_notify = xqc_client_datagram_write_callback,
-            .datagram_read_notify = xqc_client_datagram_read_callback,
-            .datagram_acked_notify = xqc_client_datagram_acked_callback,
-            .datagram_lost_notify = xqc_client_datagram_lost_callback,
-            .datagram_mss_updated_notify = xqc_client_datagram_mss_updated_callback,
         }
     };
 
     xqc_engine_register_alpn(ctx.engine, XQC_ALPN_TRANSPORT, 9, &ap_cbs);
-    /* test alpn negotiation failure */
-    xqc_engine_register_alpn(ctx.engine, XQC_ALPN_TRANSPORT_TEST, 14, &ap_cbs);
 
     user_conn_t *user_conn = xqc_client_user_conn_create(server_addr, server_port, transport);
     if (user_conn == NULL) {
@@ -4695,12 +2065,6 @@ int main(int argc, char *argv[]) {
         conn_settings.scheduler_callback  = xqc_backup_scheduler_cb;
     }
 
-    if (g_test_case == 501) {
-        conn_settings.scheduler_callback = xqc_backup_scheduler_cb;
-        conn_settings.mp_enable_reinjection = 0;
-        conn_settings.standby_path_probe_timeout = 500;
-    }
-
     unsigned char token[XQC_MAX_TOKEN_LEN];
     int token_len = XQC_MAX_TOKEN_LEN;
     token_len = xqc_client_read_token(token, token_len);
@@ -4744,28 +2108,10 @@ int main(int argc, char *argv[]) {
 
     user_conn->ctx = &ctx;
 
-    if (user_conn->h3 == 0) {
-        if (g_test_case == 7) {user_conn->token_len = -1;} /* create connection fail */
-        cid = xqc_h3_connect(ctx.engine, &conn_settings, user_conn->token, user_conn->token_len,
-                             g_host, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                             user_conn->peer_addrlen, user_conn);
-    } else if (user_conn->h3 == 2) {
-        cid = xqc_connect(ctx.engine, &conn_settings, user_conn->token, user_conn->token_len,
-                             g_host, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                             user_conn->peer_addrlen, XQC_DEFINED_ALPN_H3_EXT, user_conn);
-    } else {
-        if (g_test_case == 43) {
-            /* try a alpn not supported by server */
-            cid = xqc_connect(ctx.engine, &conn_settings, user_conn->token, user_conn->token_len,
-                            server_addr, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
-                            user_conn->peer_addrlen, XQC_ALPN_TRANSPORT_TEST, user_conn);
 
-        } else {
-            cid = xqc_connect(ctx.engine, &conn_settings, user_conn->token, user_conn->token_len,
+    cid = xqc_connect(ctx.engine, &conn_settings, user_conn->token, user_conn->token_len,
                             server_addr, g_no_crypt, &conn_ssl_config, user_conn->peer_addr, 
                             user_conn->peer_addrlen, XQC_ALPN_TRANSPORT, user_conn);
-        }
-    }
 
     if (cid == NULL) {
         printf("xqc_connect error\n");
@@ -4785,142 +2131,25 @@ int main(int argc, char *argv[]) {
         xqc_datagram_set_user_data(user_conn->quic_conn, user_conn);
  
     }
+    
+    for (int i = 0; i < g_req_paral; i++) {
+        g_req_cnt++;
+        user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
+        user_stream->user_conn = user_conn;
+        user_stream->last_recv_log_time = now();
+        user_stream->recv_log_bytes = 0;
 
-    if (user_conn->h3_conn) {
-        printf("[h3-dgram]|prepare_dgram_user_data|\n");
-        xqc_h3_ext_datagram_set_user_data(user_conn->h3_conn, user_conn);
- 
+        user_stream->stream = xqc_stream_create(ctx.engine, cid, NULL, user_stream);
+        if (user_stream->stream == NULL) {
+            printf("xqc_stream_create error\n");
+            continue;
+        }
+        printf("[qperf]|ts:%"PRIu64"|test_start|\n", now());
+        xqc_client_stream_send(user_stream->stream, user_stream);
+
     }
 
-    if (g_test_case == 501) {
-        goto skip_data;
-    }
-
-    if (g_test_case >= 300 && g_test_case < 400 && user_conn->h3 == 2) {
-        // for h3 bytestream testcases
-        // send h3 requests
-        if (g_test_case != 306 && g_test_case != 307 && g_test_case != 308 && g_test_case != 310
-            && g_test_case != 311 && g_test_case != 312 && g_test_case != 313) 
-        {
-            for (int i = 0; i < g_req_paral; i++) {
-                g_req_cnt++;
-                user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-                user_stream->user_conn = user_conn;
-                user_stream->last_recv_log_time = now();
-                user_stream->recv_log_bytes = 0;
-                user_stream->h3_request = xqc_h3_request_create(ctx.engine, cid, NULL, user_stream);
-                if (user_stream->h3_request == NULL) {
-                    printf("xqc_h3_request_create error\n");
-                    continue;
-                }
-
-                xqc_client_request_send(user_stream->h3_request, user_stream);
-
-            }
-        }
-
-        // open bytestreams and send data
-        for (int i = 0; i < g_req_paral; i++) {
-            g_bytestream_cnt++;
-            user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-            user_stream->user_conn = user_conn;
-            user_stream->last_recv_log_time = now();
-            user_stream->recv_log_bytes = 0;
-            user_stream->h3_ext_bs = xqc_h3_ext_bytestream_create(ctx.engine, cid, user_stream);
-            if (user_stream->h3_ext_bs == NULL) {
-                printf("xqc_h3_ext_bytestream_create error\n");
-                continue;
-            }
-
-            xqc_client_bytestream_send(user_stream->h3_ext_bs, user_stream);
-
-        }
-
-        // prepare to send datagrams
-        if (g_test_case != 306 && g_test_case != 307 && g_test_case != 308 && g_test_case != 310
-            && g_test_case != 311 && g_test_case != 312 && g_test_case != 313) 
-        {
-            if (g_send_dgram) {
-                user_conn->dgram_blk->data = calloc(1, g_send_body_size);
-                user_conn->dgram_blk->data[0] = 0x1;
-                user_conn->dgram_blk->data_len = g_send_body_size;
-                if (g_echo_check) {
-                    user_conn->dgram_blk->recv_data = calloc(1, g_send_body_size << 4);
-                    user_conn->dgram_blk->recv_data[0] = 0x2;
-                }
-                xqc_client_h3_ext_datagram_send(user_conn);
-            }
-        }
-
-    } else if (!g_send_dgram && g_test_case != 500) {
-
-        if (g_periodically_request) {
-            user_conn->ev_request = event_new(eb, -1, 0, xqc_client_request_callback, user_conn);
-
-            /* request once every 1 second */
-            struct timeval tv;
-            tv.tv_sec = 0;
-            tv.tv_usec = 500000;
-            int ret = event_add(user_conn->ev_request, &tv);
-            if (ret != 0) {
-                printf("[ERROR] add request event ret: %d\n", ret);
-            }
-            
-
-            printf("-----------  g_periodically_request: %d\n", g_periodically_request);
-
-        } else {
-
-            for (int i = 0; i < g_req_paral; i++) {
-                g_req_cnt++;
-                user_stream_t *user_stream = calloc(1, sizeof(user_stream_t));
-                user_stream->user_conn = user_conn;
-                user_stream->last_recv_log_time = now();
-                user_stream->recv_log_bytes = 0;
-                if (user_conn->h3 == 0 || user_conn->h3 == 2) {
-                    if (g_test_case == 11) { /* create stream fail */
-                        xqc_cid_t tmp;
-                        xqc_h3_request_create(ctx.engine, &tmp, NULL, user_stream);
-                        continue;
-                    }
-
-                    user_stream->h3_request = xqc_h3_request_create(ctx.engine, cid, &stream_settings, user_stream);
-                    if (user_stream->h3_request == NULL) {
-                        printf("xqc_h3_request_create error\n");
-                        continue;
-                    }
-
-                    xqc_client_request_send(user_stream->h3_request, user_stream);
-
-                } else {
-                    user_stream->stream = xqc_stream_create(ctx.engine, cid, NULL, user_stream);
-                    if (user_stream->stream == NULL) {
-                        printf("xqc_stream_create error\n");
-                        continue;
-                    }
-                    printf("[qperf]|ts:%"PRIu64"|test_start|\n", now());
-                    xqc_client_stream_send(user_stream->stream, user_stream);
-                }
-            }
-        }
-
-        last_recv_ts = now();
-        
-    } else {
-        user_conn->dgram_blk->data = calloc(1, g_send_body_size);
-        user_conn->dgram_blk->data_len = g_send_body_size;
-        if (g_echo_check) {
-            user_conn->dgram_blk->recv_data = calloc(1, g_send_body_size << 4);
-        }
-        if (user_conn->h3 == 2) {
-            xqc_client_h3_ext_datagram_send(user_conn);
-
-        } else if (user_conn->h3 == 1) {
-            xqc_client_datagram_send(user_conn);
-        }
-        
-    }
-skip_data:
+    last_recv_ts = now();
 
     event_base_dispatch(eb);
 
@@ -4952,7 +2181,6 @@ skip_data:
     xqc_engine_destroy(ctx.engine);
     xqc_client_close_keylog_file(&ctx);
     xqc_client_close_log_file(&ctx);
-    destroy_cdf();
 
     return 0;
 }

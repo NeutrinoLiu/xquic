@@ -515,17 +515,20 @@ xqc_client_write_socket_ex(uint64_t path_id,
 
         res = sendto(fd, send_buf, send_buf_size, 0, peer_addr, peer_addrlen);
         if (res < 0) {
-            printf("xqc_client_write_socket_ex path:%"PRIu64" err %zd %s %zu\n", path_id, res, strerror(errno), send_buf_size);
             if (errno == EAGAIN) {
+                // printf("-");
                 res = XQC_SOCKET_EAGAIN;
+                continue;
             } else {
                 res = XQC_SOCKET_ERROR;
             }
+            printf("[ts:%zu]xqc_client_write_socket_ex path:%"PRIu64" err %zd %s %zu\n", now(), path_id, res, strerror(errno), send_buf_size);
             if (errno == EMSGSIZE) {
                 res = send_buf_size;
             }
+        } else {
+                // printf(">");
         }
-
 
     } while ((res < 0) && (errno == EINTR));
 
@@ -986,7 +989,7 @@ xqc_client_stream_read_notify(xqc_stream_t *stream, void *user_data)
 
         xqc_msec_t curr_time = now();
         if ((curr_time - user_stream->last_recv_log_time) >= 200000) {
-            printf("[qperf]|ts:%"PRIu64"|recv_size:%"PRIu64"|\n", curr_time, user_stream->recv_log_bytes);
+            printf("\n[qperf]|ts:%"PRIu64"|recv_size:%"PRIu64"|\n", curr_time, user_stream->recv_log_bytes);
             user_stream->last_recv_log_time = curr_time;
             user_stream->recv_log_bytes = 0;
         }

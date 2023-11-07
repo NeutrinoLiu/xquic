@@ -1,4 +1,5 @@
 rm -f test_* *log tp_localhost xqc_token
+rm -f ../build/test_client ../build/test_server
 cd ../third_party/boringssl
 SSL_TYPE_STR="boringssl"
 SSL_PATH_STR="${PWD}"

@@ -70,6 +70,42 @@ xqc_default_reinj_can_reinject_after_sched(xqc_default_reinj_ctl_t *rctl,
 }
 
 static xqc_bool_t
+xqc_default_reinj_can_reinject_unlimited(xqc_default_reinj_ctl_t *rctl, 
+    xqc_packet_out_t *po)
+{
+    xqc_connection_t *conn = rctl->conn;
+
+    /*
+    printf("----- reinj cond: emptyq(%d) stream(%d) !not_r(%d) !not_r2(%d) sent(%d)\n",
+        xqc_list_empty(&conn->conn_send_queue->sndq_send_packets),
+        po->po_frame_types & XQC_FRAME_BIT_STREAM,
+        !(po->po_flag & XQC_POF_NOT_REINJECT),
+        !(XQC_MP_PKT_REINJECTED(po)),
+        (po->po_flag & XQC_POF_IN_FLIGHT));
+    */
+   
+    if ( 1 //xqc_list_empty(&conn->conn_send_queue->sndq_send_packets)
+        && ((po->po_frame_types & XQC_FRAME_BIT_STREAM) 
+            || (po->po_frame_types & XQC_FRAME_BIT_MAX_STREAM_DATA)
+            || (po->po_frame_types & XQC_FRAME_BIT_RESET_STREAM)
+            || (po->po_frame_types & XQC_FRAME_BIT_STOP_SENDING)
+            || (po->po_frame_types & XQC_FRAME_BIT_MAX_STREAMS)
+            || (po->po_frame_types & XQC_FRAME_BIT_MAX_DATA)
+            || (po->po_frame_types & XQC_FRAME_BIT_DATA_BLOCKED)
+            || (po->po_frame_types & XQC_FRAME_BIT_STREAM_DATA_BLOCKED)
+            || (po->po_frame_types & XQC_FRAME_BIT_STREAMS_BLOCKED)
+            || (po->po_frame_types & XQC_FRAME_BIT_CONNECTION_CLOSE))
+        && !(po->po_flag & XQC_POF_NOT_REINJECT)
+        && !(XQC_MP_PKT_REINJECTED(po))
+        && (po->po_flag & XQC_POF_IN_FLIGHT)) 
+    {   
+        return XQC_TRUE;
+    }
+
+    return XQC_FALSE;
+}
+
+static xqc_bool_t
 xqc_default_reinj_can_reinject(void *ctl, 
     xqc_packet_out_t *po, xqc_reinjection_mode_t mode)
 {
@@ -79,6 +115,9 @@ xqc_default_reinj_can_reinject(void *ctl,
     switch (mode) {
     case XQC_REINJ_UNACK_AFTER_SCHED:
         can_reinject = xqc_default_reinj_can_reinject_after_sched(rctl, po);
+        break;
+    case XQC_REINJ_FOR_RETRANSMIT:
+        can_reinject = xqc_default_reinj_can_reinject_unlimited(rctl, po);
         break;
     default:
         can_reinject = XQC_FALSE;

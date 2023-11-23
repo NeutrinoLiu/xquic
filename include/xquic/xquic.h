@@ -942,6 +942,7 @@ typedef enum {
     XQC_REINJ_UNACK_AFTER_SCHED   = 1 << 0,
     XQC_REINJ_UNACK_BEFORE_SCHED  = 1 << 1,
     XQC_REINJ_UNACK_AFTER_SEND    = 1 << 2,
+    XQC_REINJ_FOR_RETRANSMIT      = 1 << 3,
 } xqc_reinjection_mode_t;
 
 typedef struct xqc_reinj_ctl_callback_s {

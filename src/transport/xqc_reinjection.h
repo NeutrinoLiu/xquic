@@ -27,6 +27,9 @@ void xqc_conn_reinject_unack_packets(xqc_connection_t *conn,
 xqc_int_t xqc_conn_try_reinject_packet(xqc_connection_t *conn, 
     xqc_packet_out_t *packet_out);
 
+xqc_int_t xqc_conn_try_reinject_packet_instant(xqc_connection_t *conn, 
+    xqc_packet_out_t *packet_out);
+
 #endif /* XQC_REINJECTION_H */
 
 

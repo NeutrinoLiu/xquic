@@ -1239,20 +1239,32 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
 			|| (lost_pn != XQC_MAX_UINT64_VALUE && po->po_pkt.pkt_num <= lost_pn))
 		{
             if (po->po_flag & XQC_POF_IN_FLIGHT) {
-
+                int reinject_overwrite_retransmit = 0;
                 /* reinjection */
                 if (conn->enable_multipath
                     && conn->reinj_callback
-                    && conn->reinj_callback->xqc_reinj_ctl_can_reinject
-                    && conn->reinj_callback->xqc_reinj_ctl_can_reinject(conn->reinj_ctl, po, mode))
+                    && conn->reinj_callback->xqc_reinj_ctl_can_reinject)
                 {
-                    if (xqc_conn_try_reinject_packet(conn, po) == XQC_OK) {
-                        xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ|reinject lost packets|"
-                                "pkt_num:%ui|size:%ud|pkt_type:%s|frame:%s|",
-                                po->po_pkt.pkt_num, po->po_used_size,
-                                xqc_pkt_type_2_str(po->po_pkt.pkt_type),
-                                xqc_frame_type_2_str(po->po_frame_types));
-                    }   
+                    if ((mode & XQC_REINJ_UNACK_BEFORE_SCHED)
+                        && conn->reinj_callback->xqc_reinj_ctl_can_reinject(conn->reinj_ctl, po, XQC_REINJ_UNACK_BEFORE_SCHED)) {
+                            if (xqc_conn_try_reinject_packet(conn, po) == XQC_OK) {
+                                xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ|reinject lost packets|"
+                                        "pkt_num:%ui|size:%ud|pkt_type:%s|frame:%s|",
+                                        po->po_pkt.pkt_num, po->po_used_size,
+                                        xqc_pkt_type_2_str(po->po_pkt.pkt_type),
+                                        xqc_frame_type_2_str(po->po_frame_types));
+                            }
+                        }
+                    else if ((mode & XQC_REINJ_FOR_RETRANSMIT)
+                        && conn->reinj_callback->xqc_reinj_ctl_can_reinject(conn->reinj_ctl, po, XQC_REINJ_FOR_RETRANSMIT))
+                            if (xqc_conn_try_reinject_packet_instant(conn, po) == XQC_OK) {
+                                reinject_overwrite_retransmit = 1;
+                                xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ-INSTANT|reinject lost packets|"
+                                        "pkt_num:%ui|size:%ud|pkt_type:%s|frame:%s|",
+                                        po->po_pkt.pkt_num, po->po_used_size,
+                                        xqc_pkt_type_2_str(po->po_pkt.pkt_type),
+                                        xqc_frame_type_2_str(po->po_frame_types));
+                            }  
                 }
                 
                 xqc_send_ctl_decrease_inflight(conn, po);
@@ -1268,7 +1280,8 @@ xqc_send_ctl_detect_lost(xqc_send_ctl_t *send_ctl, xqc_send_queue_t *send_queue,
                 if (XQC_NEED_REPAIR(po->po_frame_types) 
                     || repair_dgram == XQC_DGRAM_RETX_ASKED_BY_APP) 
                 {
-                    xqc_send_queue_copy_to_lost(po, send_queue);
+                    if (! reinject_overwrite_retransmit)
+                        xqc_send_queue_copy_to_lost(po, send_queue);
 
                 } else {
                     if (po->po_frame_types & XQC_FRAME_BIT_DATAGRAM) {

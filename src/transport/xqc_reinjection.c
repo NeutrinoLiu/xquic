@@ -107,6 +107,53 @@ xqc_conn_try_reinject_packet(xqc_connection_t *conn, xqc_packet_out_t *packet_ou
     return XQC_OK;
 }
 
+xqc_int_t
+xqc_conn_try_reinject_packet_instant(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
+{
+    xqc_path_ctx_t *path = conn->scheduler_callback->xqc_scheduler_get_path(conn->scheduler, conn, packet_out, 0, 1, NULL);
+    if (path == NULL) {
+        xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ|fail to schedule a path|reinject|");
+        return -XQC_EMP_SCHEDULE_PATH;
+    }
+
+    xqc_send_queue_t *send_queue = conn->conn_send_queue;
+    xqc_packet_out_t *po_copy = xqc_packet_out_get(send_queue);
+    if (!po_copy) {
+        XQC_CONN_ERR(conn, XQC_EMALLOC);
+        return -XQC_EMALLOC;
+    }
+
+    xqc_packet_out_replicate(po_copy, packet_out);
+    xqc_packet_out_remove_ack_frame(po_copy);
+
+    /* update path_flag */
+    if (po_copy->po_path_flag & XQC_PATH_SPECIFIED_BY_PTO) {
+        po_copy->po_path_flag &= ~XQC_PATH_SPECIFIED_BY_PTO;
+    }
+
+    xqc_associate_packet_with_reinjection(packet_out, po_copy);
+
+    xqc_send_queue_insert_send(po_copy, &send_queue->sndq_send_packets, send_queue);
+    xqc_path_send_buffer_append(path, po_copy, &path->path_reinj_tmp_buf);
+    
+    /* move from reinj buf to path send buf */
+    xqc_list_head_t *pos, *next;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_list_splice_tail_init(&path->path_reinj_tmp_buf,
+                                  &path->path_schedule_buf[XQC_SEND_TYPE_RETRANS]);
+    }
+
+    xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ-INSTANT|scheduled|"
+            "path:%ui|stream_id:%ui|stream_offset:%ui|"
+            "pkt_type:%s|origin_pkt_path:%ui|origin_pkt_num:%ui|",
+            po_copy->po_path_id, po_copy->po_stream_id, po_copy->po_stream_offset,
+            xqc_frame_type_2_str(packet_out->po_frame_types),
+            packet_out->po_path_id, packet_out->po_pkt.pkt_num);
+
+    return XQC_OK;
+}
+
 
 void 
 xqc_conn_reinject_unack_packets(xqc_connection_t *conn, xqc_reinjection_mode_t mode)

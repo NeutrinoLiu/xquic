@@ -191,6 +191,7 @@ set(
     "src/transport/reinjection_control/xqc_reinj_deadline.c"
     "src/transport/reinjection_control/xqc_reinj_dgram.c"
     "src/transport/scheduler/xqc_scheduler_minrtt.c"
+    "src/transport/scheduler/xqc_scheduler_clamp.c"
     "src/transport/scheduler/xqc_scheduler_common.c"
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"

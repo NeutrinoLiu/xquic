@@ -932,6 +932,7 @@ typedef struct xqc_scheduler_callback_s {
 } xqc_scheduler_callback_t;
 
 XQC_EXPORT_PUBLIC_API extern const xqc_scheduler_callback_t xqc_minrtt_scheduler_cb;
+XQC_EXPORT_PUBLIC_API extern const xqc_scheduler_callback_t xqc_clamp_scheduler_cb;
 XQC_EXPORT_PUBLIC_API extern const xqc_scheduler_callback_t xqc_backup_scheduler_cb;
 XQC_EXPORT_PUBLIC_API extern const xqc_scheduler_callback_t xqc_rap_scheduler_cb;
 #ifdef XQC_ENABLE_MP_INTEROP

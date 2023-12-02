@@ -168,6 +168,23 @@ xqc_generate_path_challenge_data(xqc_connection_t *conn, xqc_path_ctx_t *path)
                           path->path_challenge_data, XQC_PATH_CHALLENGE_DATA_LEN);
 }
 
+void
+xqc_path_init_PSI_shm(xqc_path_ctx_t *path) {
+    const char PSI_FILE_PATH[][128] = {
+        "/dev/shm/PSI_0",
+        "/dev/shm/PSI_1"
+    };
+    const uint64_t SHM_SIZE = 1;
+    int fd = -1;
+    
+    if ((fd = open(PSI_FILE_PATH[path->path_id], O_RDWR, 0)) == -1) {
+        printf("[CLAMP] PSI not available for %s\n", PSI_FILE_PATH[path->path_id]);
+        path->PSI_shm_ptr = NULL;
+    } // when PSI not available, its shm is empty
+
+    path->PSI_shm_ptr = (char*) mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+}
+
 xqc_int_t
 xqc_path_init(xqc_path_ctx_t *path, xqc_connection_t *conn)
 {
@@ -213,6 +230,8 @@ xqc_path_init(xqc_path_ctx_t *path, xqc_connection_t *conn)
 
     xqc_log(conn->engine->log, XQC_LOG_DEBUG, "|path:%ui|dcid:%s|scid:%s|state:%d|",
             path->path_id, xqc_dcid_str(&path->path_dcid), xqc_scid_str(&path->path_scid), path->path_state);
+
+    xqc_path_init_PSI_shm(path);
 
     return XQC_OK;
 }

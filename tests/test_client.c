@@ -1945,6 +1945,7 @@ int main(int argc, char *argv[]) {
         .keyupdate_pkt_threshold = 0,
         .max_datagram_frame_size = g_max_dgram_size,
         .enable_multipath = g_enable_multipath,
+        .scheduler_callback = xqc_clamp_scheduler_cb,
         .multipath_version = g_multipath_version,
         .marking_reinjection = 1,
         .mp_ping_on = g_mp_ping_on,

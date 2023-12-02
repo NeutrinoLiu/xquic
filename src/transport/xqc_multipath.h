@@ -14,6 +14,13 @@
 #include "src/transport/xqc_recv_record.h"
 #include "src/transport/xqc_frame_parser.h"
 
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
 
 /* enable multipath */
 typedef enum {
@@ -163,6 +170,9 @@ struct xqc_path_ctx_s {
     /* PTMUD */
     size_t              curr_pkt_out_size;
     size_t              path_max_pkt_out_size;
+
+    /* CLAMP */
+    char               *PSI_shm_ptr;
 };
 
 /* 埋点路径信息 */

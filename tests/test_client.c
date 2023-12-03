@@ -275,6 +275,8 @@ int hsk_completed = 0;
 
 int g_periodically_request = 0;
 
+int g_clamp_scheduler = 0;
+
 static uint64_t last_recv_ts = 0;
 
 static inline uint64_t 
@@ -1567,7 +1569,7 @@ int main(int argc, char *argv[]) {
     };
 
     int ch = 0;
-    while ((ch = getopt_long(argc, argv, "a:p:P:n:c:Ct:T:1s:w:r:l:Ed:u:H:h:Gx:6NMR:i:V:v:q:o:fe:F:D:b:B:J:Q:U:Ayz", long_opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "a:p:P:n:c:Ct:T:1s:w:r:l:Ed:u:H:h:Gx:6NMR:i:V:v:q:o:fe:F:D:b:B:J:Q:U:AyzX", long_opts, NULL)) != -1) {
         switch (ch) {
         case 'U':
             printf("option send_datagram 0 (off), 1 (on), 2(on + batch): %s\n", optarg);
@@ -1771,6 +1773,10 @@ int main(int argc, char *argv[]) {
             printf("option periodically send request :%s\n", "on");
             g_periodically_request = 1;
             break;
+        case 'X':
+            printf("CLAMP scheduler enabled :%s\n", "on");
+            g_clamp_scheduler = 1;
+            break;
         /* long options */
         case 0:
 
@@ -1930,6 +1936,9 @@ int main(int argc, char *argv[]) {
     }
     printf("congestion control flags: %x\n", cong_flags);
 
+    xqc_scheduler_callback_t sched = xqc_minrtt_scheduler_cb;
+    if (g_clamp_scheduler) sched = xqc_clamp_scheduler_cb;
+
     xqc_conn_settings_t conn_settings = {
         .pacing_on  =   pacing_on,
         .ping_on    =   0,
@@ -1945,7 +1954,7 @@ int main(int argc, char *argv[]) {
         .keyupdate_pkt_threshold = 0,
         .max_datagram_frame_size = g_max_dgram_size,
         .enable_multipath = g_enable_multipath,
-        .scheduler_callback = xqc_clamp_scheduler_cb,
+        .scheduler_callback = sched,
         .multipath_version = g_multipath_version,
         .marking_reinjection = 1,
         .mp_ping_on = g_mp_ping_on,

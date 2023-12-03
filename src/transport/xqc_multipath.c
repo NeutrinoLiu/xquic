@@ -180,6 +180,7 @@ xqc_path_init_PSI_shm(xqc_path_ctx_t *path) {
     if ((fd = open(PSI_FILE_PATH[path->path_id], O_RDWR, 0)) == -1) {
         printf("[CLAMP] PSI not available for %s\n", PSI_FILE_PATH[path->path_id]);
         path->PSI_shm_ptr = NULL;
+        return;
     } // when PSI not available, its shm is empty
 
     path->PSI_shm_ptr = (char*) mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

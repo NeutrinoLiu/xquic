@@ -23,8 +23,10 @@ xqc_clamp_scheduler_init(void *scheduler, xqc_log_t *log, xqc_scheduler_params_t
 xqc_bool_t
 xqc_scheduler_path_in_handover(xqc_path_ctx_t *path)
 {
-    if (    path->PSI_shm_ptr && 
-           (path->PSI_shm_ptr)[0] != 0   ) return XQC_TRUE;
+    if (path->PSI_shm_ptr) {
+        if   ((path->PSI_shm_ptr)[0] != 0 ) 
+            return XQC_TRUE;
+    }
     return XQC_FALSE;
 }
 

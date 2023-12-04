@@ -275,6 +275,7 @@ int hsk_completed = 0;
 int g_periodically_request = 0;
 
 int g_clamp_scheduler = 0;
+int g_smaller_send_buf = 1024;
 
 static uint64_t last_recv_ts = 0;
 
@@ -590,6 +591,8 @@ xqc_client_create_socket(int type,
         goto err;
     }
 
+
+    size = 1 * g_smaller_send_buf * 1024;
     if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(int)) < 0) {
         printf("setsockopt failed, errno: %d\n", errno);
         goto err;
@@ -1568,7 +1571,7 @@ int main(int argc, char *argv[]) {
     };
 
     int ch = 0;
-    while ((ch = getopt_long(argc, argv, "a:p:P:n:c:Ct:T:1s:w:r:l:Ed:u:H:h:Gx:6NMR:i:V:v:q:o:fe:F:D:b:B:J:Q:U:AyzX", long_opts, NULL)) != -1) {
+    while ((ch = getopt_long(argc, argv, "a:p:P:n:c:Ct:T:1s:w:r:l:Ed:u:H:h:Gx:6NMR:i:V:v:q:o:fe:F:D:b:B:J:Q:U:AyzXS:", long_opts, NULL)) != -1) {
         switch (ch) {
         case 'U':
             printf("option send_datagram 0 (off), 1 (on), 2(on + batch): %s\n", optarg);
@@ -1775,6 +1778,10 @@ int main(int argc, char *argv[]) {
         case 'X':
             printf("CLAMP scheduler enabled :%s\n", "on");
             g_clamp_scheduler = 1;
+            break;
+        case 'S':
+            printf("Smaller snd buffer size (KB):%s\n", optarg);
+            g_smaller_send_buf = atoi(optarg);
             break;
         /* long options */
         case 0:

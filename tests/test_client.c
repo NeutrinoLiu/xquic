@@ -36,8 +36,7 @@ printf_null(const char *format, ...)
 
 #define DEBUG printf("%s:%d (%s)\n", __FILE__, __LINE__, __FUNCTION__);
 
-#define TEST_DROP (g_drop_rate != 0 && rand() % 1000 < g_drop_rate)
-
+#define TEST_DROP XQC_FALSE
 #define TEST_SERVER_ADDR "127.0.0.1"
 #define TEST_SERVER_PORT 8443
 
@@ -1987,6 +1986,7 @@ int main(int argc, char *argv[]) {
         case 'd': config.cfg_log_level = XQC_LOG_DEBUG; break;
         default: config.cfg_log_level = XQC_LOG_DEBUG;
     }
+    config.cfg_log_event = 1;
 
 
 

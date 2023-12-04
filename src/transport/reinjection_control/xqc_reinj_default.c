@@ -119,6 +119,9 @@ xqc_default_reinj_can_reinject(void *ctl,
     case XQC_REINJ_FOR_RETRANSMIT:
         can_reinject = xqc_default_reinj_can_reinject_unlimited(rctl, po);
         break;
+    case XQC_HANDOVER_AWARE_REINJ:
+        can_reinject = xqc_default_reinj_can_reinject_unlimited(rctl, po);
+        break;
     default:
         can_reinject = XQC_FALSE;
         break;

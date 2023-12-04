@@ -2108,8 +2108,9 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
     /* try to reinject unacked packets if paths still have cwnd */
     if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) {
         xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_BEFORE_SCHED);
-    } else if (some_path_in_ho(conn)) {
-        xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_BEFORE_SCHED);
+    } 
+    if ((conn->conn_settings.mp_enable_reinjection & XQC_HANDOVER_AWARE_REINJ) && some_path_in_ho(conn)) {
+        xqc_conn_reinject_unack_packets(conn, XQC_HANDOVER_AWARE_REINJ);
     }
 
     head = &conn->conn_send_queue->sndq_send_packets;

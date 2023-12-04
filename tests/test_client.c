@@ -2082,6 +2082,9 @@ int main(int argc, char *argv[]) {
     } else if (g_enable_reinjection == 5) {
         conn_settings.reinj_ctl_callback    = xqc_default_reinj_ctl_cb;
         conn_settings.mp_enable_reinjection = XQC_REINJ_FOR_RETRANSMIT;
+    } else if (g_enable_reinjection == 6) {
+        conn_settings.reinj_ctl_callback    = xqc_default_reinj_ctl_cb;
+        conn_settings.mp_enable_reinjection = XQC_HANDOVER_AWARE_REINJ;
     }
 
     if (g_mp_backup_mode) {

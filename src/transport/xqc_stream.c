@@ -1299,9 +1299,9 @@ xqc_stream_recv(xqc_stream_t *stream, unsigned char *recv_buf, size_t recv_buf_s
     stream->stream_conn->conn_flow_ctl.fc_data_read += read;
 
     xqc_log(stream->stream_conn->log, XQC_LOG_DEBUG,
-            "|stream_id:%ui|read:%z|recv_buf_size:%uz|fin:%d|stream_length:%ui|next_read_offset:%ui|conn:%p|",
+            "|stream_id:%ui|read:%z|recv_buf_size:%uz|fin:%d|stream_length:%ui|next_read_offset:%ui|conn:%p|merged_offset_end:%ui|",
             stream->stream_id, read, recv_buf_size, *fin, stream->stream_data_in.stream_length,
-            stream->stream_data_in.next_read_offset, stream->stream_conn);
+            stream->stream_data_in.next_read_offset, stream->stream_conn, stream->stream_data_in.merged_offset_end);
 
     xqc_stream_shutdown_read(stream);
 

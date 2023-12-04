@@ -2075,6 +2075,18 @@ xqc_conn_schedule_end(xqc_connection_t *conn)
     }
 }
 
+xqc_bool_t some_path_in_ho(xqc_connection_t *conn) {
+    xqc_list_head_t *pos, *next;
+    xqc_path_ctx_t *path;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        if (path->PSI_shm_ptr)
+            if ((path->PSI_shm_ptr)[0] > 0)
+                return XQC_TRUE;
+    }
+    return XQC_FALSE;
+}
+
 void
 xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
 {
@@ -2094,7 +2106,7 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
                               XQC_SEND_TYPE_NORMAL_HIGH_PRI);
 
     /* try to reinject unacked packets if paths still have cwnd */
-    if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) {
+    if ((conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) && some_path_in_ho(conn)) {
         xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_BEFORE_SCHED);
     }
 

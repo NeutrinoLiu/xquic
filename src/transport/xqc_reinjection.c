@@ -183,9 +183,11 @@ xqc_conn_reinject_unack_packets(xqc_connection_t *conn, xqc_reinjection_mode_t m
     }
 
     xqc_path_ctx_t *path;
-    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
-        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
-        xqc_list_splice_tail_init(&path->path_reinj_tmp_buf,
-                                  &path->path_schedule_buf[XQC_SEND_TYPE_NORMAL]);
+    if (! (mode & XQC_HANDOVER_AWARE_REINJ)) {
+        xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+            path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+            xqc_list_splice_tail_init(&path->path_reinj_tmp_buf,
+                                        &path->path_schedule_buf[XQC_SEND_TYPE_NORMAL]);
+        }
     }
 }

@@ -110,7 +110,7 @@ xqc_conn_try_reinject_packet(xqc_connection_t *conn, xqc_packet_out_t *packet_ou
 xqc_int_t
 xqc_conn_try_reinject_packet_instant(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
 {
-    xqc_path_ctx_t *path = conn->scheduler_callback->xqc_scheduler_get_path(conn->scheduler, conn, packet_out, 0, 1, NULL);
+    xqc_path_ctx_t *path = conn->scheduler_callback->xqc_scheduler_get_path(conn->scheduler, conn, packet_out, 1, 1, NULL);
     if (path == NULL) {
         xqc_log(conn->log, XQC_LOG_DEBUG, "|MP|REINJ|fail to schedule a path|reinject|");
         return -XQC_EMP_SCHEDULE_PATH;
@@ -167,8 +167,9 @@ xqc_conn_reinject_unack_packets(xqc_connection_t *conn, xqc_reinjection_mode_t m
             && conn->reinj_callback->xqc_reinj_ctl_can_reinject
             && conn->reinj_callback->xqc_reinj_ctl_can_reinject(conn->reinj_ctl, packet_out, mode))
         {
-                    
-            if (xqc_conn_try_reinject_packet(conn, packet_out) != XQC_OK) {
+            if (mode & XQC_HANDOVER_AWARE_REINJ) {
+                if (xqc_conn_try_reinject_packet_instant(conn, packet_out) != XQC_OK) continue;
+            } else if (xqc_conn_try_reinject_packet(conn, packet_out) != XQC_OK) {
                 continue;
             }
 
